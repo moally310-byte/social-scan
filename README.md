@@ -2,6 +2,8 @@
 
 **A Claude Code skill that audits any creator's or brand's public Instagram, TikTok and YouTube in about a minute.** Hand it a handle and it finds the posts that broke out, shows the hooks that made them work, and tells you how much of the account rides on a few hits. No logins, no cookies, no paid analytics seat.
 
+<p align="center"><img src="assets/demo.gif" width="480" alt="social-scan demo: scanning MrBeast's public TikTok and YouTube from Claude Code, through the outlier chart, to the full report and install command"></p>
+
 ## What you get
 
 You ask Claude: *"scan @duolingo's TikTok and YouTube."* About 50 seconds later (YouTube and TikTok; Instagram adds roughly 25 seconds) you get a report like this (real run, public data, 2026-10-15):
