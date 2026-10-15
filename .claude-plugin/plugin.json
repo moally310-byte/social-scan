@@ -1,0 +1,13 @@
+{
+  "name": "social-scan",
+  "version": "1.0.0",
+  "description": "Audit any creator's or brand's public Instagram, TikTok and YouTube in about a minute: outlier posts by lift, hooks (caption, first 10 seconds of speech, first frame), comment mining, cadence and top-3 share. Logged-out data only.",
+  "author": {
+    "name": "Mo Ally",
+    "url": "https://github.com/moally310-byte"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/moally310-byte/social-scan",
+  "repository": "https://github.com/moally310-byte/social-scan",
+  "keywords": ["social-media", "instagram", "tiktok", "youtube", "creator-marketing", "audit", "hooks", "yt-dlp"]
+}

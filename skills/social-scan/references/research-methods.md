@@ -1,0 +1,73 @@
+# Research methods: outliers, hooks, comments, competitor teardown
+
+Read this after `report` when writing the brief, and before comparing accounts.
+
+**Source.** Methods adapted from ScrapeCreators [`social-media-research-skills`](https://github.com/ScrapeCreators/social-media-research-skills) @ `64ba7b4dea71e130d2712ffb6c1c1024b3b7c4b2` (MIT, (c) 2026 ScrapeCreators): `outlier-post-finder`, `transcript-intelligence`, `comment-mining`, `competitor-social-research`, `creator-profile-teardown`. Their skills run on the paid ScrapeCreators API; the methods below are rewired to yt-dlp, Apify and local whisper-cli. Where a rule is ours and not theirs, it says **(ours)**.
+
+## Outlier scoring (built into `report`)
+
+- Baseline = the **median** views of the group (platform x format: reels, photos/carousels, TikTok, Shorts, long-form), never the mean, so one hit can't move it. Posts under 3 days old stay out of the baseline.
+- `lift = views / group median`. Tiers: **huge 5x+, strong 2-5x, mild 1.5-2x** (source). Under 0.2x is a dud (ours).
+- `Eng. lift = (likes + comments) / group median of the same`. Shares and saves only exist on TikTok logged out, so they stay out (ours). Shown only when 10+ posts in the group have like counts.
+- Confidence: low under 10 baseline posts (source: "do not overstate confidence from fewer than 10 posts"). Medium 10-19, high 20+ (ours: the source only says "pull at least 20").
+- Lift is within one account's group. Never rank raw views across accounts of different sizes, and never pool platforms into one baseline.
+- Pinned posts get a lift boost from placement; fresh posts are still climbing. Both are marked in the table.
+- Per-post `lift` is in `posts.csv` and `summary.json` for any other cut.
+
+## Why it worked (the brief, written by Claude)
+
+For each top post and its bottom-post contrast, look at:
+- **The three hook channels:** text hook (caption opening), spoken hook (first 10 s), visual hook (`hooks/*.jpg`, often carries on-screen text). Strong posts usually stack two.
+- **Hook category** (ours): curiosity, contrarian, problem-aware, outcome, story, authority, comparison, mistake, demonstration, before/after, timely, identity, objection-handling. Tag top and bottom hooks; a category that repeats only in the top rows is a finding.
+- Topic, format, guest or creator authority, novelty or timeliness (a release, a season), emotional trigger, controversy, and what the comments show (confusion, desire, debate).
+- Say "appears to" or "suggests". Performance shows correlation; the account's own analytics would show cause.
+
+## Hooks (`hooks` command)
+
+- Text hook = the caption's opening sentence (verbatim). Spoken hook = whisper-cli base.en on the first 20 s, keeping confident segments that start in the first 10 s. Visual hook = the frame at 0.5 s.
+- Machine transcripts get names and small words wrong ("I don't have" for "they don't have" in testing). Quote a spoken hook in client copy only after checking it against the video or the frame's burned-in captions.
+- "No speech found" means music, animal sound, or a text-only open. The frame shows which. Whisper's default no-speech cut turned bird calls into "I'm not sure."; the script runs `-nth 0.3`.
+- For a full transcript of a specific post (segment it into hook, setup, claim, evidence, payoff, CTA; pull claims, stories, frameworks, quotable lines), use a transcript tool on that post. Keep every quote tied to its URL.
+
+## Comment mining (`comments` command, then judgment)
+
+Sources: YouTube via yt-dlp, top-sorted, up to `--max` per post. Instagram from the reels scrape itself (`latestComments`, the newest ~15 per post, no extra cost). TikTok returns 0 comments logged out (see Gaps). Handles are dropped on purpose; `by_creator` flags the account's own replies so they aren't read as audience.
+
+1. Drop spam, bots, emoji-only replies and creator replies.
+2. Tag each useful comment: questions, objections, complaints or pain points, praise, confusion, requests or ideas, buying intent, controversy or debate, jokes or culture signals.
+3. Cluster into themes. Score each by frequency (how many) and intensity (strength of wording, likes). One loud comment is not a pattern.
+4. Keep exact wording for anything reusable. Slang and misspellings are the point.
+5. Turn it into actions: reply-video ideas, FAQ or content ideas, objection angles.
+6. State the sample (posts, comments, newest-only for IG) and confidence. One post's comments are not market sentiment.
+
+## Competitor teardown (method only; no `compare` command yet)
+
+1. Confirm each handle belongs to the right brand before pulling; a shared name is not a match.
+2. Run each account into its own dated folder with the same `--limit` and `--since`.
+3. Compare from each `summary.json`: posts per week, median per group, **outlier rate** (share of baseline posts at 2x+), top 3 share, best format (the group with the most 2x+ posts), followers per 1K views. Never raw views across accounts.
+4. Run `hooks` on each and compare hook categories and channels across the top rows.
+5. Output: snapshot table (account, platforms, audience, cadence, best format, notes) / what is working per account / cross-account patterns / gaps table (Opportunity, Evidence, Suggested test) / three content tests.
+
+## The brief (`brief.md` beside `summary.md`)
+
+```markdown
+# <Account>: social research brief (<date>)
+## Summary            sample, window, baselines, confidence per group
+## Biggest outliers   post, platform, date, views, lift, tier, why it likely worked
+## Repeatable patterns 2-4, each with evidence rows
+## Hooks swipe file   verbatim, with channel + category + URL; top vs bottom contrast
+## Comment themes     theme, bucket, frequency, intensity, exact quote
+## Content tests      3, each tied to an outlier or a comment theme
+## Caveats            public data only, sample sizes, pinned/fresh, machine transcripts
+```
+
+## Gaps (ScrapeCreators-endpoint only, not adopted)
+
+| Their skill or source | Why not here | Reopen when |
+|---|---|---|
+| `ad-library-teardown` (Meta, TikTok, Google, LinkedIn ad libraries) | Paid ScrapeCreators endpoints. Meta is partly covered by the Apify `facebook-ads-scraper` add-on in SKILL.md | You need ad history beyond Meta |
+| LinkedIn, Threads, X/Twitter, Facebook, Bluesky, Reddit, Rumble, Pinterest posts, comments and transcripts | No logged-out yt-dlp or vetted Apify path wired here | An account's main channel is one of these |
+| `trend-discovery`, `social-listening-brief`, `audience-research` (keyword and trending search across platforms) | Needs ScrapeCreators search endpoints | You want niche trend sweeps |
+| `influencer-prospecting` (creator search) | ScrapeCreators search endpoints; the Apify profile scraper covers known handles only | You need creator or guest prospecting |
+| `product-demand-research` (TikTok Shop) | ScrapeCreators TikTok Shop endpoints | An account sells on TikTok Shop |
+| TikTok comments | yt-dlp returned 0 of 78 logged out in testing; an Apify TikTok comments actor is the likely path, untested | A TikTok-first audit needs comments |

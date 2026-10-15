@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "social-scan",
+  "owner": {
+    "name": "Mo Ally",
+    "url": "https://github.com/moally310-byte"
+  },
+  "plugins": [
+    {
+      "name": "social-scan",
+      "source": "./",
+      "description": "Audit any creator's or brand's public Instagram, TikTok and YouTube in under a minute: outlier posts, hooks, comments, cadence."
+    }
+  ]
+}
