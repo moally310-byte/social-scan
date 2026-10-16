@@ -58,6 +58,7 @@ Script: `scripts/social_scan.py` in this skill's folder (written `SCAN` below; u
 - Posts under 3 days old are still climbing; the report leaves them out of the bottom 5, the baseline and the tier counts.
 - **Lift** = a post's views ÷ its own group's median (reels with reels, Shorts with Shorts). Tiers: huge 5x+, strong 2-5x, mild 1.5-2x. Confidence: low under 10 posts, medium 10-19, high 20+. Never compare lift or raw views across accounts without the teardown method.
 - Pinned posts sit in the Instagram sample whatever their age (the reels tab has its own pins, separate from the grid's). The report lists them but keeps them out of the dates, cadence, median, tier counts and followers per 1K.
+- Un-enriched YouTube uploads (past the newest `--yt-enrich`) only carry a "3 months ago"-style date, so their dates bunch onto a few days and can be months late. The report marks them (approx) and leaves them out of per week and the gap check; `date_approx` in `posts.csv` and `summary.json` says which. Raise `--yt-enrich` to date more.
 - A following count far above the follower count suggests follow-for-follow, which inflates followers.
 - **Top 3 share** = the three biggest posts' share of all views. A high share means the account lives on a few hits, which is a finding in itself.
 
