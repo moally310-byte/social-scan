@@ -3,10 +3,21 @@
 
 Backends
   YouTube, TikTok  -> yt-dlp, run here (logged out, no cookies)
-  Instagram        -> Apify REST (`collect --instagram`, APIFY_TOKEN from the
-                      environment) or Apify MCP dataset JSON via `ingest-ig`
+  Instagram        -> Apify REST (`scan --instagram` or `collect --instagram`,
+                      APIFY_TOKEN from the environment) or Apify MCP dataset
+                      JSON via `ingest-ig`
 
-Commands
+Start here
+  doctor     [--get-model]   what's installed, what each missing piece turns off,
+                             and the install line for macOS and Linux
+  scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--name N]
+             [--tiktok-followers N] [--limit N] [--yt-enrich N] [--no-hooks] [--no-comments]
+                             collect, hooks, comments and report in one go;
+                             a step whose tool is missing is skipped with a note.
+                             Use one --out folder per account: scan reports
+                             everything already in it.
+
+Single steps
   collect    --out DIR [--youtube H] [--tiktok H] [--instagram H] [--limit N] [--yt-enrich N]
   ingest-ig  --out DIR (--reels reels.json | --posts posts.json) [--profile profile.json]
   meta       --out DIR --platform P --followers N [--following N] [--source TEXT]
@@ -18,6 +29,7 @@ Outlier lift tiers and the hooks pass are adapted from ScrapeCreators'
 social-media-research-skills @ 64ba7b4 (MIT): outlier-post-finder and
 transcript-intelligence, rewired to yt-dlp, Apify and local whisper-cli.
 
+Tools come from PATH; YTDLP, FFMPEG, WHISPER_CLI and WHISPER_MODEL override them.
 Everything is read-only. Never add --cookies or --cookies-from-browser.
 """
 import argparse
@@ -26,16 +38,26 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
+import shutil
 import statistics
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
-YTDLP = os.environ.get("YTDLP", "yt-dlp")
-FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
-WHISPER = os.environ.get("WHISPER_CLI", "whisper-cli")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", os.path.expanduser("~/.local/share/whisper-cpp/ggml-base.en.bin"))
+# overrides may arrive with a quoted, unexpanded ~ ("~/bin/yt-dlp"), so expand them here
+YTDLP = os.path.expanduser(os.environ.get("YTDLP") or "yt-dlp")
+FFMPEG = os.path.expanduser(os.environ.get("FFMPEG") or "ffmpeg")
+WHISPER = os.path.expanduser(os.environ.get("WHISPER_CLI") or "whisper-cli")
+WHISPER_MODEL = os.path.expanduser(os.environ.get("WHISPER_MODEL") or "~/.local/share/whisper-cpp/ggml-base.en.bin")
 TODAY = dt.date.today()
+
+MIN_PY = (3, 8)
+MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+# sha256 of the model files `doctor --get-model` checks after download (matches Hugging Face's x-linked-etag)
+MODEL_SHA256 = {"ggml-base.en.bin": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"}
+YTDLP_STALE_DAYS = 90  # YouTube and TikTok change often; an older yt-dlp is the usual cause of a failed collect
 
 # lift = views / the group's settled median (outlier-post-finder tiers)
 TIERS = ((5.0, "huge"), (2.0, "strong"), (1.5, "mild"))
@@ -59,10 +81,18 @@ def ytdlp_json(url, extra=(), flat=True, timeout=300):
     if flat:
         cmd.append("--flat-playlist")
     cmd += list(extra) + [url]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise RuntimeError(f"{YTDLP} not found (run `doctor` for the install line)")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"yt-dlp timed out after {timeout} s")
     if p.returncode != 0:
         raise RuntimeError(p.stderr.strip().splitlines()[-1] if p.stderr.strip() else "yt-dlp failed")
-    return json.loads(p.stdout)
+    try:
+        return json.loads(p.stdout)
+    except ValueError:  # json.JSONDecodeError
+        raise RuntimeError("yt-dlp returned unreadable output (an old yt-dlp is the usual cause; `doctor` checks its age)")
 
 
 def to_date(entry):
@@ -132,12 +162,13 @@ def handle_of(h):
 
 def collect_youtube(handle, out, limit, enrich):
     base = f"https://www.youtube.com/@{handle_of(handle)}"
-    posts, followers = [], None
+    posts, followers, errs = [], None, []
     for tab, kind in (("videos", "long"), ("shorts", "short")):
         try:
             d = ytdlp_json(f"{base}/{tab}", ["--playlist-end", str(limit),
                                               "--extractor-args", "youtubetab:approximate_date"])
         except RuntimeError as e:
+            errs.append(f"{tab}: {e}")
             print(f"  youtube/{tab}: skipped ({e})", file=sys.stderr)
             continue
         save(os.path.join(out, "raw", f"youtube_{tab}.json"), d)
@@ -153,6 +184,8 @@ def collect_youtube(handle, out, limit, enrich):
                 "pinned": False, "caption": first_line(e.get("title")),
                 "hook_text": first_line(e.get("title"), 300),
             })
+    if not posts and errs:  # nothing came back: leave any earlier posts_youtube.json alone
+        raise RuntimeError("neither the videos nor the Shorts tab loaded (yt-dlp's errors are above)")
 
     # Flat listings lack likes, comments and (for Shorts) dates. Fetch full
     # metadata for the newest N so the report can compute rates.
@@ -187,10 +220,11 @@ def collect_youtube(handle, out, limit, enrich):
         save(os.path.join(out, "meta_youtube.json"),
              {"followers": followers, "following": None, "source": "yt-dlp channel_follower_count",
               "pulled": TODAY.isoformat()})
-    print(f"  youtube: {len(posts)} posts, {followers} subscribers", file=sys.stderr)
+    print(f"  youtube: {len(posts)} posts, "
+          + (f"{followers:,} subscribers" if followers is not None else "subscriber count not shown"), file=sys.stderr)
 
 
-def collect_tiktok(handle, out, limit):
+def collect_tiktok(handle, out, limit, quiet_followers=False):
     d = ytdlp_json(f"https://www.tiktok.com/@{handle_of(handle)}", ["--playlist-end", str(limit)])
     save(os.path.join(out, "raw", "tiktok.json"), d)
     posts = []
@@ -207,7 +241,9 @@ def collect_tiktok(handle, out, limit):
     if not posts:
         print("  tiktok: 0 posts (private, empty, or blocked)", file=sys.stderr)
     save(os.path.join(out, "posts_tiktok.json"), posts)
-    print(f"  tiktok: {len(posts)} posts (followers not available from yt-dlp; use `meta`)", file=sys.stderr)
+    print(f"  tiktok: {len(posts)} posts" + ("" if quiet_followers else
+          f" (followers aren't visible logged out; add them with: python3 {here()} meta --out {shlex.quote(out)} "
+          "--platform tiktok --followers N)"), file=sys.stderr)
 
 
 def apify_items(actor, payload, max_items, max_usd=IG_MAX_USD):
@@ -218,9 +254,11 @@ def apify_items(actor, payload, max_items, max_usd=IG_MAX_USD):
     pay-per-result actors, maxTotalChargeUsd caps pay-per-event ones.
     """
     import urllib.request
-    token = os.environ.get("APIFY_TOKEN")
+    token = os.environ.get("APIFY_TOKEN", "").strip()
     if not token:
-        raise RuntimeError("APIFY_TOKEN is not set (see SKILL.md, Instagram section)")
+        raise RuntimeError("APIFY_TOKEN is not set (see SKILL.md step 3)")
+    if re.search(r"\s", token):  # http.client would quote the whole header, token included, in its error
+        raise RuntimeError("APIFY_TOKEN has a space or line break inside it; export it again")
     url = (f"https://api.apify.com/v2/acts/{actor.replace('/', '~')}/run-sync-get-dataset-items"
            f"?timeout=240&maxItems={int(max_items)}&maxTotalChargeUsd={max_usd}&clean=true")
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
@@ -228,6 +266,12 @@ def apify_items(actor, payload, max_items, max_usd=IG_MAX_USD):
                                           "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=300) as r:
         return json.load(r)
+
+
+def redact(text):
+    """Error text with the Apify token masked, in case a library quoted it."""
+    token = os.environ.get("APIFY_TOKEN", "").strip()
+    return str(text).replace(token, "<APIFY_TOKEN>") if token else str(text)
 
 
 def collect_instagram(handle, out, limit):
@@ -238,7 +282,12 @@ def collect_instagram(handle, out, limit):
     rp, pr = os.path.join(out, "raw", "instagram_reels.json"), os.path.join(out, "raw", "instagram_profile.json")
     save(rp, reels)  # saved first, so a profile failure doesn't lose a paid scrape
     # no retries: a retried run-sync call starts (and bills) a second run
-    profile = apify_items("apify/instagram-profile-scraper", {"usernames": [h]}, 1)
+    try:
+        profile = apify_items("apify/instagram-profile-scraper", {"usernames": [h]}, 1)
+    except Exception as e:  # the follower count is the cheap part; keep the reels in the report
+        ingest_ig(rp, None, out, feed="reels")
+        raise RuntimeError(f"follower count not pulled ({redact(e)}); the reels are in the report. Add followers with: "
+                           f"python3 {here()} meta --out {shlex.quote(out)} --platform instagram --followers N")
     save(pr, profile)
     ingest_ig(rp, pr, out, feed="reels")
 
@@ -246,6 +295,9 @@ def collect_instagram(handle, out, limit):
 def ingest_ig(posts_path, profile_path, out, feed="reels"):
     """feed: "reels" for the reels-tab scrape (contiguous), "posts" for the
     older posts-feed scrape, which is kept readable for past runs but flagged."""
+    if not os.path.isfile(posts_path):
+        sys.exit(f"{posts_path} not found, so nothing was ingested (the path is read from where you run "
+                 "the command, not from --out)")
     raw = load(posts_path, [])
     if isinstance(raw, dict):
         raw = raw.get("items") or raw.get("data") or []
@@ -457,10 +509,42 @@ def fetch_clip(plat, p, seconds, path):
     return ("video link expired or blocked: " if plat == "instagram" else "") + err[:160]
 
 
+def model_problem(path):
+    """None when `path` looks like a whisper.cpp model, otherwise what's wrong with it."""
+    if not os.path.isfile(path):
+        return "not found"
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except OSError as e:
+        return f"unreadable ({e.strerror})"
+    # ggml model files start with "lmgg"; a failed download often saves an HTML or JSON error page instead
+    if magic not in (b"lmgg", b"GGUF"):
+        return f"not a whisper.cpp model ({size:,} bytes, starts {magic!r})"
+    if size < 10_000_000:  # the smallest published model is about 31 MB
+        return f"truncated ({size:,} bytes)"
+    return None
+
+
+def speech_off(detail=False):
+    """Why spoken hooks can't run here, or None when they can. The short form
+    goes into hooks.json and summary.md, so it never carries a local path."""
+    if not shutil.which(FFMPEG):
+        return "ffmpeg not installed"
+    if not shutil.which(WHISPER):
+        return "whisper-cli not installed"
+    problem = model_problem(WHISPER_MODEL)
+    if not problem:
+        return None
+    short = "whisper model missing" if problem == "not found" else "whisper model damaged"
+    return f"{short} ({problem} at {WHISPER_MODEL})" if detail else short
+
+
 def spoken_hook(wav, stem):
     """whisper-cli on the clip; keep confident speech segments that start inside the hook window."""
     if not os.path.exists(WHISPER_MODEL):
-        return None, f"whisper model missing at {WHISPER_MODEL}"
+        return None, "whisper model missing"
     # -nth 0.3 (default 0.6): stricter no-speech cut. On 2026-10-15 the default
     # turned bird calls under a text-overlay reel into "I'm not sure." (p 0.81);
     # 0.3 dropped it and kept every real-speech segment on the same run.
@@ -492,6 +576,16 @@ def hooks(out, top, bottom, seconds):
     targets = pick_targets(build_groups(all_posts, metas), top, bottom)
     hdir = os.path.join(out, "hooks")
     os.makedirs(hdir, exist_ok=True)
+    # degrade instead of failing: no ffmpeg keeps caption openings only, no
+    # whisper keeps captions and frames, no yt-dlp keeps YouTube/TikTok captions only
+    no_speech = speech_off()
+    no_frames = not shutil.which(FFMPEG)
+    no_clips = not shutil.which(YTDLP)
+    if no_speech:
+        keeps = "caption openings only" if no_frames else "caption openings and first frames"
+        print(f"  hooks: {speech_off(detail=True)}, so {keeps}, no spoken hooks (`doctor` has the fix)", file=sys.stderr)
+    if no_clips and any(t[0] != "instagram" for t in targets):
+        print("  hooks: yt-dlp not installed, so YouTube and TikTok keep caption openings only", file=sys.stderr)
 
     def one(t):
         plat, group, role, p = t
@@ -503,35 +597,64 @@ def hooks(out, top, bottom, seconds):
         if p.get("kind") in ("image", "carousel"):
             e["spoken_status"] = "photo or carousel: text hook only"
             return e
-        clip, wav = stem + ".mp4", stem + ".wav"
-        err = fetch_clip(plat, p, seconds, clip)
-        if err:
-            e["spoken_status"] = err
+        if no_frames:
+            e["spoken_status"] = f"skipped: {no_speech}"
             return e
-        subprocess.run([FFMPEG, "-v", "error", "-y", "-ss", "0.5", "-i", clip, "-frames:v", "1",
-                        "-vf", "scale=360:-2", stem + ".jpg"], capture_output=True, timeout=60)
-        if os.path.exists(stem + ".jpg"):
-            e["frame"] = os.path.relpath(stem + ".jpg", out)
-        for src in (clip, p.get("audio_url")):
-            if src and subprocess.run([FFMPEG, "-v", "error", "-y", "-t", str(seconds), "-i", src, "-vn",
-                                       "-ar", "16000", "-ac", "1", wav], capture_output=True, timeout=90).returncode == 0:
-                break
-        e["spoken_hook"], e["spoken_status"] = spoken_hook(wav, stem + ".whisper") if os.path.exists(wav) \
-            else (None, "no audio track")
-        for f in (clip, wav):  # keep the frame and transcript as receipts, not the client's video
-            if os.path.exists(f):
-                os.remove(f)
+        if no_clips and plat != "instagram":
+            e["spoken_status"] = "skipped: yt-dlp not installed"
+            return e
+        clip, wav = stem + ".mp4", stem + ".wav"
+        try:
+            err = fetch_clip(plat, p, seconds, clip)
+            if err:
+                e["spoken_status"] = err
+                return e
+            subprocess.run([FFMPEG, "-v", "error", "-y", "-ss", "0.5", "-i", clip, "-frames:v", "1",
+                            "-vf", "scale=360:-2", stem + ".jpg"], capture_output=True, timeout=60)
+            if os.path.exists(stem + ".jpg"):
+                e["frame"] = os.path.relpath(stem + ".jpg", out)
+            if no_speech:
+                e["spoken_status"] = f"skipped: {no_speech}"
+                return e
+            for src in (clip, p.get("audio_url")):
+                if src and subprocess.run([FFMPEG, "-v", "error", "-y", "-t", str(seconds), "-i", src, "-vn",
+                                           "-ar", "16000", "-ac", "1", wav], capture_output=True, timeout=90).returncode == 0:
+                    break
+            e["spoken_hook"], e["spoken_status"] = spoken_hook(wav, stem + ".whisper") if os.path.exists(wav) \
+                else (None, "no audio track")
+        except subprocess.TimeoutExpired as err:  # one stuck tool shouldn't sink the batch
+            e["spoken_status"] = f"failed: {os.path.basename(str(err.cmd[0]))} timed out after {err.timeout:g} s"
+            print(f"    {plat} {p['id']}: {err}", file=sys.stderr)
+        except (OSError, subprocess.SubprocessError) as err:  # the report gets no local paths, stderr gets the detail
+            e["spoken_status"] = f"failed: {getattr(err, 'strerror', None) or type(err).__name__}"
+            print(f"    {plat} {p['id']}: {err}", file=sys.stderr)
+        finally:
+            for f in (clip, wav):  # keep the frame and transcript as receipts, not the client's video
+                if os.path.exists(f):
+                    os.remove(f)
         return e
 
     with ThreadPoolExecutor(max_workers=3) as ex:
         entries = list(ex.map(one, targets))
     save(os.path.join(out, "hooks.json"), entries)
     ok = sum(1 for e in entries if e["spoken_status"] == "ok")
-    print(f"  hooks: {len(entries)} posts, {ok} spoken hooks transcribed; rerun `report` to add the Hooks section",
-          file=sys.stderr)
+    print(f"  hooks: {len(entries)} posts, {ok} spoken hooks transcribed -> hooks.json", file=sys.stderr)
     for e in entries:
-        if e["spoken_status"] != "ok":
+        if e["spoken_status"] != "ok" and not (e["spoken_status"] or "").startswith("skipped: "):
             print(f"    {e['platform']} {e['id']}: {e['spoken_status']}", file=sys.stderr)
+
+
+def hooks_stale(out):
+    """True when hooks.json came from an earlier collect than the posts now in the
+    folder: each entry keeps the view count its post had when it was picked, and
+    live counts move between collects. (File times can't be trusted: a copied
+    folder gets new ones.)"""
+    entries = load(os.path.join(out, "hooks.json"))
+    if not entries:
+        return False
+    views = {(p["platform"], p["id"]): p.get("views") for p in load_posts(out)[0]}
+    matched = [e for e in entries if (e["platform"], e["id"]) in views]
+    return not matched or any(e.get("views") != views[(e["platform"], e["id"])] for e in matched)
 
 
 def hooks_section(out, all_posts):
@@ -539,20 +662,37 @@ def hooks_section(out, all_posts):
     if not entries:
         return []
     live = {(p["platform"], p["id"]): p for p in all_posts}
-    L = ["## Hooks: top posts vs bottom posts",
-         "Text hook = caption or title first line, verbatim. Spoken hook = whisper-cli (base.en) on the first "
-         f"{HOOK_WINDOW_MS // 1000} seconds, machine transcript: check it against the video before quoting. "
-         "Frame = the picture at 0.5 seconds, the visual hook.", ""]
+    entries = [e for e in entries if (e["platform"], e["id"]) in live]  # --since can drop some
+    if not entries:
+        return []
+    # a column nothing filled (tools missing on this run) is left out instead of
+    # repeating the reason in every row of a client-facing table
+    spoken = any(e.get("spoken_hook") is not None for e in entries)
+    frames = any(e.get("frame") for e in entries)
+    secs = HOOK_WINDOW_MS // 1000
+    intro = "Text hook = caption or title first line, verbatim."
+    if spoken:
+        intro += (f" Spoken hook = whisper-cli (base.en) on the first {secs} seconds, machine transcript: "
+                  "check it against the video before quoting.")
+    if frames:
+        intro += " Frame = the picture at 0.5 seconds, the visual hook."
+    missing = [w for w, on in (("spoken hooks", spoken), ("first frames", frames)) if not on]
+    if missing:
+        intro += f" {' and '.join(missing).capitalize()} weren't pulled on this run."
+    head = ["Post", "Role", "Lift", "Text hook"] + ([f"Spoken hook (first {secs} s)"] if spoken else []) \
+        + (["Frame"] if frames else [])
+    L = ["## Hooks: top posts vs bottom posts", intro, ""]
     for group in dict.fromkeys(e["group"] for e in entries):
-        L += [f"**{group.title()}**", "| Post | Role | Lift | Text hook | Spoken hook (first 10 s) | Frame |",
-              "|---|---|---|---|---|---|"]
+        L += [f"**{group.title()}**", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
         for e in (x for x in entries if x["group"] == group):
-            p = live.get((e["platform"], e["id"]), e)
+            p = live[(e["platform"], e["id"])]
             text_hook = caption_hook(p.get("hook_text")) if p.get("hook_text") else e.get("text_hook")
-            spoken = f'"{cell(e["spoken_hook"])}"' if e.get("spoken_hook") else f"_{cell(e.get('spoken_status'))}_"
-            frame = f"[frame]({e['frame']})" if e.get("frame") else ""
-            L.append(f"| [{fmt(p.get('views'))}]({e['url']}) | {e['role']} | {lift_txt(p)} | "
-                     f"{cell(text_hook)} | {spoken} | {frame} |")
+            row = [f"[{fmt(p.get('views'))}]({e['url']})", e["role"], lift_txt(p), cell(text_hook)]
+            if spoken:
+                row.append(f'"{cell(e["spoken_hook"])}"' if e.get("spoken_hook") else f"_{cell(e.get('spoken_status'))}_")
+            if frames:
+                row.append(f"[frame]({e['frame']})" if e.get("frame") else "")
+            L.append("| " + " | ".join(row) + " |")
         L.append("")
     return L
 
@@ -561,6 +701,9 @@ def comments(out, top, max_comments):
     """Comment text for the top posts: YouTube via yt-dlp, Instagram from the posts scrape."""
     all_posts, metas, _ = load_posts(out)
     targets = [t for t in pick_targets(build_groups(all_posts, metas), top, 0) if t[0] != "tiktok"]
+    if not shutil.which(YTDLP) and any(t[0] == "youtube" for t in targets):
+        print("  comments: yt-dlp not installed, so YouTube comments are left out", file=sys.stderr)
+        targets = [t for t in targets if t[0] != "youtube"]
     inline = load(os.path.join(out, "comments_instagram_inline.json"), {})
     result = []
     for plat, group, _, p in targets:
@@ -646,7 +789,7 @@ def lift_txt(p):
     return f"{p['lift']:.1f}x" if p["lift"] >= 0.95 else f"{p['lift']:.2f}x"
 
 
-def report(out, name, since):
+def report(out, name, since, note=None):
     all_posts, metas, undated_dropped = load_posts(out, since)
     if not all_posts:
         sys.exit("No posts found. Run collect / ingest-ig first.")
@@ -668,7 +811,8 @@ def report(out, name, since):
     for plat in ("instagram", "tiktok", "youtube"):
         m = metas.get(plat)
         if m:
-            L.append(f"| {plat} | {fmt(m.get('followers'))} | {fmt(m.get('following'))} | {m.get('source', '')} |")
+            src = m.get("source", "") + (f", pulled {m['pulled']}" if m.get("pulled") else "")
+            L.append(f"| {plat} | {fmt(m.get('followers'))} | {fmt(m.get('following'))} | {src} |")
     L.append("")
 
     L += ["## Scorecard",
@@ -721,7 +865,14 @@ def report(out, name, since):
                      f"{fmt(p.get('likes'))} | {p['caption']} |")
         L.append("")
 
-    L += hooks_section(out, all_posts)
+    if hooks_stale(out):
+        msg = "Hooks section left out: hooks.json was built from an earlier collect"
+        if note:
+            note(msg + " (run scan without --no-hooks to rebuild it)")
+        else:
+            print(f"  report: {msg}; run `hooks` again to add it", file=sys.stderr)
+    else:
+        L += hooks_section(out, all_posts)
 
     L += ["## Read this before quoting numbers",
           "- Views are plays from a logged-out view. Instagram plays count replays. None of these are unique viewers.",
@@ -751,16 +902,411 @@ def report(out, name, since):
              for p in all_posts if p.get("lift") is not None]
     save(os.path.join(out, "summary.json"), {"pulled": TODAY.isoformat(), "name": name, "accounts": metas,
                                              "groups": slim, "posts": lifts})
-    print(os.path.join(out, "summary.md"))
+    return os.path.join(out, "summary.md")
+
+
+# ---------- doctor and scan ----------
+
+# yt-dlp's standalone Linux build brings its own Python: the plain `yt-dlp`
+# release runs on the system python3 and current yt-dlp needs 3.10+.
+YTDLP_LINUX = ('sudo curl -fL -o /usr/local/bin/yt-dlp "https://github.com/yt-dlp/yt-dlp/releases/latest/download/'
+               'yt-dlp_linux$([ "$(uname -m)" = aarch64 ] && echo _aarch64)" && sudo chmod a+rx /usr/local/bin/yt-dlp')
+# (label, command) lines per item; an empty label continues the step above it.
+# Linux lines are for Debian and Ubuntu. whisper.cpp is in apt from Ubuntu 26.04;
+# older releases build it (whisper.cpp's README steps; the symlink works because
+# a CMake build-tree binary keeps an absolute RPATH to its libraries).
+INSTALL = {
+    "python": [("macOS", "brew install python"), ("Linux", "sudo apt install python3")],
+    "yt-dlp": [("macOS", "brew install yt-dlp"), ("Linux", YTDLP_LINUX)],
+    "ffmpeg": [("macOS", "brew install ffmpeg"), ("Linux", "sudo apt install ffmpeg")],
+    "whisper-cli": [
+        ("macOS", "brew install whisper.cpp"),
+        ("Linux, Ubuntu 26.04 or newer", "sudo apt install whisper.cpp"),
+        ("Linux, older releases (builds from source, a few minutes)", "sudo apt install build-essential cmake git"),
+        ("", "[ -d ~/whisper.cpp ] || git clone --depth 1 https://github.com/ggml-org/whisper.cpp ~/whisper.cpp"),
+        ("", "cmake -S ~/whisper.cpp -B ~/whisper.cpp/build && cmake --build ~/whisper.cpp/build -j --config Release"),
+        ("", "sudo ln -sf ~/whisper.cpp/build/bin/whisper-cli /usr/local/bin/whisper-cli"),
+    ],
+    "deno": [("macOS", "brew install deno"), ("Linux", "curl -fsSL https://deno.land/install.sh | sh")],
+}
+BREW_FORMULA = {"python": "python", "yt-dlp": "yt-dlp", "ffmpeg": "ffmpeg", "whisper-cli": "whisper.cpp", "deno": "deno"}
+# each line says only what that one piece turns off; the summary lines say what's left
+DISABLES = {
+    "python": "everything",
+    "yt-dlp": "YouTube and TikTok (required for both)",
+    "ffmpeg": "first-frame images and spoken hooks",
+    "whisper-cli": "spoken hooks (the first 10 seconds of speech)",
+    "whisper model": "spoken hooks (the first 10 seconds of speech)",
+    "deno": "full YouTube support (yt-dlp works without it for now, but warns that some formats may be missing)",
+    "APIFY_TOKEN": "Instagram",
+}
+OPTIONAL = {"ffmpeg", "whisper-cli", "whisper model", "deno", "APIFY_TOKEN"}
+TOOLS = (("yt-dlp", "YTDLP", YTDLP, "--version"), ("ffmpeg", "FFMPEG", FFMPEG, "-version"),
+         ("whisper-cli", "WHISPER_CLI", WHISPER, "--version"), ("deno", None, "deno", "--version"))
+# where installers put tools when a minimal PATH (GUI apps, cron) leaves them out
+COMMON_BINS = ("/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bin"),
+               os.path.expanduser("~/.deno/bin"))
+
+
+def here():
+    return shlex.quote(os.path.abspath(__file__))
+
+
+def off_path(cmd):
+    """A common install folder that holds `cmd` but isn't on PATH, else None."""
+    if os.sep in cmd:
+        return None
+    for d in COMMON_BINS:
+        if os.access(os.path.join(d, cmd), os.X_OK):
+            return d
+    return None
+
+
+def probe():
+    """{name: (status, detail)} for each dependency; status is PASS, WARN, MISSING or BROKEN.
+
+    Local only: it runs each tool's version flag and checks whether
+    APIFY_TOKEN is set, never what it is.
+    """
+    st = {}
+    v = sys.version_info
+    st["python"] = ("PASS", f"{v.major}.{v.minor}.{v.micro} at {sys.executable}")
+    for name, env, cmd, flag in TOOLS:
+        opt = " (optional)" if name in OPTIONAL else ""
+        path = shutil.which(cmd)
+        if not path:
+            d = off_path(cmd)
+            if d:
+                st[name] = ("MISSING", f"found in {d}, but that folder isn't on PATH{opt}")
+            elif env and os.environ.get(env):
+                st[name] = ("MISSING", f"{env}={cmd} doesn't point at a program{opt}")
+            else:
+                st[name] = ("MISSING", f"not installed{opt}")
+            continue
+        try:
+            r = subprocess.run([path, flag], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            st[name] = ("BROKEN", f"{path} didn't answer {flag} within 30 s")
+            continue
+        except OSError as e:
+            st[name] = ("BROKEN", f"{path} won't start ({e.strerror})")
+            continue
+        text = (r.stdout + "\n" + r.stderr).strip()
+        if r.returncode != 0:  # whisper-cli builds without --version still exit 0 on an unknown flag
+            st[name] = ("BROKEN", f"{path} won't run (exit {r.returncode}: {(text.splitlines() or [''])[-1][:120]})")
+            continue
+        m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})" if name == "yt-dlp" else r"(?:version:?|deno) (\S+)", text)
+        st[name] = ("PASS", f"{'.'.join(m.groups()) if m else 'version unknown'} at {path}")
+        if name == "yt-dlp" and m:
+            age = (TODAY - dt.date(*map(int, m.groups()))).days
+            if age > YTDLP_STALE_DAYS:
+                st[name] = ("WARN", st[name][1] + f", {age} days old (an old yt-dlp is the usual reason YouTube or TikTok fail)")
+    problem = model_problem(WHISPER_MODEL) or pin_problem(WHISPER_MODEL)
+    if problem:
+        st["whisper model"] = ("MISSING" if problem == "not found" else "BROKEN", f"{problem} at {WHISPER_MODEL} (optional)")
+    else:
+        st["whisper model"] = ("PASS", f"{os.path.getsize(WHISPER_MODEL) / 1e6:.0f} MB at {WHISPER_MODEL}")
+    raw = os.environ.get("APIFY_TOKEN", "")
+    if not raw.strip():
+        st["APIFY_TOKEN"] = ("MISSING", "not set (optional: Instagram only, paid per use through Apify)")
+    elif re.search(r"\s", raw.strip()):
+        st["APIFY_TOKEN"] = ("BROKEN", "set, but it has a space or line break inside it (value not shown)")
+    else:
+        st["APIFY_TOKEN"] = ("PASS", "set (value not shown)")
+    return st
+
+
+def fix_lines(name, status, detail):
+    """(label, command) lines that fix this item; the command is always last on its line, so it pastes clean."""
+    if name == "yt-dlp" and status == "WARN":
+        return [("macOS", "brew upgrade yt-dlp"), ("Linux (standalone build)", "sudo yt-dlp -U"),
+                ("Linux (from pip or apt)", YTDLP_LINUX)]
+    env = next((e for n, e, _, _ in TOOLS if n == name), None)
+    if env and os.environ.get(env) and "doesn't point at a program" in detail:
+        return [(f"macOS and Linux ({env} points at a missing program; fix the path or drop the override)",
+                 f"unset {env}")] + list(INSTALL[name])
+    if detail.startswith("found in "):
+        d = re.match(r"found in (.+?), but", detail).group(1)
+        return [("macOS and Linux", f'export PATH="{d}:$PATH"')]
+    if name in INSTALL:
+        lines = list(INSTALL[name])
+        if status == "BROKEN":
+            lines[0] = ("macOS", f"brew reinstall {BREW_FORMULA[name]}")
+        return lines
+    if name == "whisper model":
+        if os.path.basename(WHISPER_MODEL) not in MODEL_SHA256:
+            return [("macOS and Linux (WHISPER_MODEL names a model --get-model doesn't fetch)", "unset WHISPER_MODEL"),
+                    ("", f"python3 {here()} doctor --get-model")]
+        env = f"WHISPER_MODEL={shlex.quote(WHISPER_MODEL)} " if os.environ.get("WHISPER_MODEL") else ""
+        return [("macOS and Linux (downloads about 148 MB from Hugging Face)", f"{env}python3 {here()} doctor --get-model")]
+    return [("macOS and Linux (token: Apify Console > Settings > API & Integrations)", "export APIFY_TOKEN=YOUR_TOKEN")]
+
+
+def doctor(get_model_too):
+    if get_model_too:
+        get_model(WHISPER_MODEL)
+    print("social-scan doctor\n", flush=True)
+    st = probe()
+    pad = " " * 26
+    for name, (status, detail) in st.items():
+        print(f"  {status:<8} {name:<14} {detail}")
+        if status == "PASS":
+            continue
+        if status != "WARN":
+            print(f"{pad}turns off: {DISABLES[name]}")
+        for label, cmd in fix_lines(name, status, detail):
+            print(f"{pad}{label}: {cmd}" if label else f"{pad}  {cmd}")
+    ok = {k for k, (s, _) in st.items() if s in ("PASS", "WARN")}
+    need = [n for n in ("yt-dlp",) if n not in ok]
+    print()
+    if need:
+        print("YouTube and TikTok: not ready; install yt-dlp (lines above), then run doctor again.")
+    elif st["yt-dlp"][0] == "WARN":
+        print("YouTube and TikTok: ready, but update yt-dlp first (lines above).")
+    else:
+        print("YouTube and TikTok: ready.")
+    if {"ffmpeg", "whisper-cli", "whisper model"} <= ok:
+        print("Hooks: caption's first line, first frame and spoken hook.")
+    elif "ffmpeg" in ok:
+        print("Hooks: caption's first line and first frame; no spoken hook.")
+    else:
+        print("Hooks: caption's first line only; no first frame, no spoken hook.")
+    print("Instagram: " + (f"ready (paid per use through Apify: about $0.11 per 40 reels, capped at ${IG_MAX_USD:.2f} per call)."
+                           if "APIFY_TOKEN" in ok else
+                           "off (optional; paid per use through Apify, about $0.11 per 40 reels; set APIFY_TOKEN to turn it on)."))
+    if not need:
+        print(f"\nNext (one folder per account): python3 {here()} scan --out ./scans/HANDLE --youtube @HANDLE --tiktok HANDLE")
+    return 0 if not need else 1
+
+
+def pin_problem(path):
+    """For a file whose name has a pinned sha256: None when it matches, else what's wrong."""
+    import hashlib
+    want = MODEL_SHA256.get(os.path.basename(path))
+    if not want:
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError as e:
+        return f"unreadable ({e.strerror})"
+    return None if h.hexdigest() == want else "doesn't match its pinned sha256 (a cut-off or swapped download)"
+
+
+def get_model(path):
+    """Download the pinned whisper.cpp model to `path`. Runs only on `doctor --get-model`."""
+    import hashlib
+    import urllib.request
+    path = os.path.abspath(path)
+    if not model_problem(path) and not pin_problem(path):
+        print(f"  whisper model already in place at {path} (sha256 checked)", file=sys.stderr)
+        return
+    name = os.path.basename(path)
+    if name not in MODEL_SHA256:  # only fetch what has a pinned checksum
+        sys.exit(f"--get-model only fetches {', '.join(MODEL_SHA256)}, whose sha256 it checks, and WHISPER_MODEL "
+                 f"ends in {name}. Download that file yourself, or unset WHISPER_MODEL.")
+    url, want = MODEL_URL + name, MODEL_SHA256[name]
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    part, h, got = path + ".part", hashlib.sha256(), 0
+    print(f"  downloading {url}", file=sys.stderr)
+    try:  # the finally below removes the .part on every way out, Ctrl-C included
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r, open(part, "wb") as f:
+                total, shown = int(r.headers.get("Content-Length") or 0), -1
+                for chunk in iter(lambda: r.read(1 << 20), b""):
+                    f.write(chunk)
+                    h.update(chunk)
+                    got += len(chunk)
+                    if total and got * 20 // total != shown:
+                        shown = got * 20 // total
+                        print(f"\r  {got / 1e6:.0f} of {total / 1e6:.0f} MB", end="", file=sys.stderr, flush=True)
+            print(file=sys.stderr)
+            if total and got != total:
+                raise ConnectionError(f"the download stopped at {got / 1e6:.0f} of {total / 1e6:.0f} MB")
+        except Exception as e:  # network, TLS, HTTP or disk trouble: a hand download with the same check is safe
+            q, qp = shlex.quote(path), shlex.quote(part)
+            fetch = f"curl -fL -o {qp} {url} && echo '{want}  '{qp} |"
+            sys.exit(f"\nModel download failed ({e}); nothing was saved. Rerun `doctor --get-model` once the network "
+                     "is back, or fetch it by hand (it only moves into place if the checksum matches):\n"
+                     f"  macOS: {fetch} shasum -a 256 -c && mv {qp} {q}\n"
+                     f"  Linux: {fetch} sha256sum -c && mv {qp} {q}")
+        if h.hexdigest() != want:
+            sys.exit(f"\nThe downloaded {name} doesn't match its pinned sha256, so it was thrown away. "
+                     "Don't fetch it by hand; try again later, and open an issue if it keeps happening.")
+        problem = model_problem(part)
+        if problem:
+            sys.exit(f"\nThe downloaded {name} looks wrong ({problem}), so it was thrown away.")
+        os.replace(part, path)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+    print(f"  saved {got / 1e6:.0f} MB to {path} (sha256 checked)", file=sys.stderr)
+
+
+def scan(a):
+    """collect, hooks, comments and report in one go. A step whose tool or
+    token is missing is skipped with a one-line note instead of failing."""
+    t0, notes, ran = time.time(), [], []
+
+    def note(msg):  # collected for the recap at the end, so each one prints once
+        notes.append(msg)
+
+    todo = [(p, h) for p, h in (("youtube", a.youtube), ("tiktok", a.tiktok), ("instagram", a.instagram)) if h]
+    if not todo and not load_posts(a.out)[0]:
+        sys.exit("scan needs --youtube, --tiktok or --instagram (or an --out folder that already holds collected posts)")
+    rp = os.path.join(a.out, "raw", "instagram_reels.json")
+    for plat, h in todo:
+        if plat != "instagram" and not shutil.which(YTDLP):
+            note(f"{plat} skipped: yt-dlp isn't installed (`doctor` has the install line)")
+            continue
+        if plat == "instagram" and not os.environ.get("APIFY_TOKEN", "").strip():
+            note("instagram skipped: APIFY_TOKEN isn't set in this shell (optional, paid per use through Apify). "
+                 "Set it in your own terminal and run the scan there, or see SKILL.md step 3")
+            continue
+        ran.append(plat)
+        try:  # one platform failing shouldn't sink the others
+            if plat == "youtube":
+                collect_youtube(h, a.out, a.limit, a.yt_enrich)
+            elif plat == "tiktok":
+                collect_tiktok(h, a.out, a.limit, quiet_followers=True)  # the recap prints the follow-up
+            else:
+                print(f"  instagram: Apify reels scrape, about $0.11 per 40 reels, capped at ${IG_MAX_USD:.2f} per call",
+                      file=sys.stderr)
+                collect_instagram(h, a.out, min(a.limit, 50))
+        except Exception as e:
+            msg = f"{plat} failed: {redact(e)}"
+            pi = os.path.join(a.out, "posts_instagram.json")
+            if plat == "instagram" and os.path.exists(rp) and os.path.getmtime(rp) >= t0 \
+                    and not (os.path.exists(pi) and os.path.getmtime(pi) >= t0):
+                msg += (". The reels were saved, so this recovers them without a second paid run: "
+                        f"python3 {here()} ingest-ig --out {shlex.quote(a.out)} --reels {shlex.quote(rp)}, "
+                        f"then: python3 {here()} scan --out {shlex.quote(a.out)}")
+            note(msg)
+    if a.tiktok_followers is not None:
+        save(os.path.join(a.out, "meta_tiktok.json"), {"followers": a.tiktok_followers, "following": None,
+                                                       "source": "tiktok profile page (scan --tiktok-followers)",
+                                                       "pulled": TODAY.isoformat()})
+    if todo:  # anything this run didn't refresh came from an earlier run: say so
+        for plat in ("youtube", "tiktok", "instagram"):
+            f = os.path.join(a.out, f"posts_{plat}.json")
+            if not (os.path.exists(f) and os.path.getmtime(f) < t0):
+                continue
+            when = dt.datetime.fromtimestamp(os.path.getmtime(f)).strftime("%Y-%m-%d %H:%M")
+            # SKILL.md step 3 ingests Instagram from the Apify MCP into this folder just before scan
+            if plat == "instagram" and plat not in dict(todo) and os.path.exists(rp) and t0 - os.path.getmtime(f) < 6 * 3600:
+                note(f"instagram: the posts ingested at {when} go into the report")
+            else:
+                note(f"{plat}: posts_{plat}.json was already in this folder (saved {when}) and goes into the report; "
+                     "if it's another account's, use a new --out folder per account")
+        for plat in dict(todo):
+            m = load(os.path.join(a.out, f"meta_{plat}.json"))
+            if m and os.path.getmtime(os.path.join(a.out, f"meta_{plat}.json")) < t0:
+                flag = " pass --tiktok-followers N to update it," if plat == "tiktok" else ""
+                note(f"{plat}: the follower count ({fmt(m.get('followers'))}) is from an earlier run, pulled "
+                     f"{m.get('pulled', '?')};{flag} or use a new --out folder if it's another account's")
+
+    posts, metas, _ = load_posts(a.out)
+    if not posts:
+        for n in notes:
+            print(f"  - {n}", file=sys.stderr)
+        if not ran:
+            hint = "The notes above say what was skipped; `doctor` shows what's missing."
+        elif [p for p in ran if p != "instagram"]:
+            hint = ("Check the errors above: usually a mistyped handle or a private account. If the handles are right, "
+                    "update yt-dlp (`doctor` checks its age).")
+        else:
+            hint = ("Check the Instagram error above: 401 means APIFY_TOKEN is wrong, 402 means the Apify account is out "
+                    "of credit; otherwise check the username.")
+        sys.exit("Nothing was collected, so there's no report. " + hint)
+    if not a.no_hooks:
+        if not shutil.which(YTDLP) and not any(p["platform"] == "instagram" for p in posts):
+            note("hooks skipped: yt-dlp isn't installed, so any earlier hooks.json is kept")
+        else:
+            try:
+                hooks(a.out, 3, 2, 20)
+            except Exception as e:
+                note(f"hooks failed: {e}")
+            else:  # describe what the step produced, not what the tools predicted
+                hs = load(os.path.join(a.out, "hooks.json"), []) or []
+                frames = sum(1 for e in hs if e.get("frame"))
+                spoken = sum(1 for e in hs if e.get("spoken_status") == "ok")
+                failed = [e for e in hs if not (e.get("spoken_status") or "ok").startswith(
+                    ("ok", "skipped", "no speech", "photo", "no audio"))]
+                skips = sorted({e["spoken_status"][len("skipped: "):] for e in hs
+                                if (e.get("spoken_status") or "").startswith("skipped: ")})
+                if skips or failed:
+                    note(f"hooks: {len(hs)} posts, {spoken} spoken hooks, {frames} first frames"
+                         + (f"; left out because {', '.join(skips)}" if skips else "")
+                         + (f"; {len(failed)} clip{'' if len(failed) == 1 else 's'} failed (first: {failed[0]['spoken_status'][:100]})"
+                            if failed else "") + " (`doctor` has the fixes)")
+    if not a.no_comments:
+        if not shutil.which(YTDLP) and not any(p["platform"] == "instagram" for p in posts):
+            note("comments skipped: yt-dlp isn't installed")
+        else:
+            try:
+                comments(a.out, 3, 100)
+            except Exception as e:
+                note(f"comments failed: {e}")
+            else:
+                cs = load(os.path.join(a.out, "comments.json"), []) or []
+                bad = [c for c in cs if (c.get("source") or "").startswith("yt-dlp failed")]
+                if bad:
+                    note(f"comments: {len(bad)} of {len(cs)} posts didn't load (first: {bad[0]['source'][:120]})")
+                if not shutil.which(YTDLP) and any(p["platform"] == "youtube" for p in posts):
+                    note("comments: YouTube left out because yt-dlp isn't installed")
+    prev = load(os.path.join(a.out, "summary.json"), {}) or {}
+    name = a.name or (handle_of(todo[0][1]) if todo else None) or prev.get("name")
+    path = report(a.out, name, None, note=note)
+
+    print(f"\nscan finished in {time.time() - t0:.0f} s", file=sys.stderr)
+    for plat in ("youtube", "tiktok", "instagram"):
+        n = sum(1 for p in posts if p["platform"] == plat)
+        if n:
+            f = (metas.get(plat) or {}).get("followers")
+            who = "subscribers" if plat == "youtube" else "followers"
+            print(f"  {plat:<10} {n} posts" + (f", {fmt(f)} {who}" if f is not None else ""), file=sys.stderr)
+    if any(p["platform"] == "tiktok" for p in posts) and "tiktok" not in metas:
+        print("  tiktok followers aren't visible logged out. Read them off the profile page, then add them with:\n"
+              f"    python3 {here()} scan --out {shlex.quote(a.out)} --tiktok-followers N --no-hooks --no-comments",
+              file=sys.stderr)
+    if notes:
+        print("Notes:", file=sys.stderr)
+        for n in notes:
+            print(f"  - {n}", file=sys.stderr)
+    print(path)
 
 
 # ---------- cli ----------
 
 def main():
+    # before argparse: on Python 3.6 add_subparsers(required=...) itself fails
+    if sys.version_info < MIN_PY:
+        sys.exit(f"social-scan needs Python {MIN_PY[0]}.{MIN_PY[1]} or newer; this is {sys.version.split()[0]} "
+                 f"at {sys.executable}.\n  macOS: brew install python\n  Linux: sudo apt install python3")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("collect")
+    d = sub.add_parser("doctor", help="what's installed, what each missing piece turns off, and how to install it")
+    d.add_argument("--get-model", action="store_true",
+                   help="download the whisper model to WHISPER_MODEL (about 148 MB from Hugging Face, sha256-checked); "
+                        "nothing is downloaded without this flag")
+
+    s = sub.add_parser("scan", help="collect, hooks, comments and report in one go (one --out folder per account)")
+    s.add_argument("--out", required=True, help="folder for this account's run; scan reports everything already in it")
+    s.add_argument("--youtube")
+    s.add_argument("--tiktok")
+    s.add_argument("--instagram", help="needs APIFY_TOKEN in the environment; skipped with a note when it isn't set")
+    s.add_argument("--name", help="report title (default: the first handle)")
+    s.add_argument("--tiktok-followers", type=int, help="follower count read off the TikTok profile (yt-dlp can't see it)")
+    s.add_argument("--limit", type=int, default=60, help="posts per tab/profile (default 60; Instagram max 50)")
+    s.add_argument("--yt-enrich", type=int, default=45,
+                   help="fetch likes/comments/exact dates for the newest N YouTube uploads (default 45, 0 = off)")
+    s.add_argument("--no-hooks", action="store_true", help="skip the hooks step")
+    s.add_argument("--no-comments", action="store_true", help="skip the comments step")
+
+    c = sub.add_parser("collect", help="collect posts only")
     c.add_argument("--out", required=True)
     c.add_argument("--youtube")
     c.add_argument("--tiktok")
@@ -769,14 +1315,14 @@ def main():
     c.add_argument("--yt-enrich", type=int, default=45,
                    help="fetch likes/comments/exact dates for the newest N YouTube uploads (default 45, 0 = off)")
 
-    i = sub.add_parser("ingest-ig")
+    i = sub.add_parser("ingest-ig", help="load Instagram JSON saved from the Apify MCP")
     i.add_argument("--out", required=True)
     src = i.add_mutually_exclusive_group(required=True)
     src.add_argument("--reels", help=f"{IG_REELS_ACTOR} dataset JSON (contiguous newest reels)")
     src.add_argument("--posts", help="older apify/instagram-scraper posts-feed JSON; readable, but flagged unreliable")
     i.add_argument("--profile")
 
-    m = sub.add_parser("meta")
+    m = sub.add_parser("meta", help="record a follower count by hand")
     m.add_argument("--out", required=True)
     m.add_argument("--platform", required=True, choices=["instagram", "tiktok", "youtube"])
     m.add_argument("--followers", type=int, required=True)
@@ -794,14 +1340,18 @@ def main():
     k.add_argument("--top", type=int, default=3, help="top posts per group (default 3)")
     k.add_argument("--max", type=int, default=100, help="YouTube comments per post (default 100)")
 
-    r = sub.add_parser("report")
+    r = sub.add_parser("report", help="write summary.md, summary.json and posts.csv")
     r.add_argument("--out", required=True)
     r.add_argument("--name")
     r.add_argument("--since")
 
     a = ap.parse_args()
+    if a.cmd == "doctor":
+        sys.exit(doctor(a.get_model))
     os.makedirs(a.out, exist_ok=True)
-    if a.cmd == "collect":
+    if a.cmd == "scan":
+        scan(a)
+    elif a.cmd == "collect":
         if not (a.youtube or a.tiktok or a.instagram):
             sys.exit("collect needs at least one of --youtube, --tiktok, --instagram")
         for flag, fn in ((a.youtube, lambda: collect_youtube(a.youtube, a.out, a.limit, a.yt_enrich)),
@@ -812,7 +1362,7 @@ def main():
             try:  # one platform failing shouldn't sink the others
                 fn()
             except Exception as e:
-                print(f"  FAILED: {e}", file=sys.stderr)
+                print(f"  FAILED: {redact(e)}", file=sys.stderr)
     elif a.cmd == "ingest-ig":
         ingest_ig(a.reels or a.posts, a.profile, a.out, feed="reels" if a.reels else "posts")
     elif a.cmd == "meta":
@@ -820,10 +1370,11 @@ def main():
              {"followers": a.followers, "following": a.following, "source": a.source, "pulled": TODAY.isoformat()})
     elif a.cmd == "hooks":
         hooks(a.out, a.top, a.bottom, a.seconds)
+        print("  run `report` to add the Hooks section to summary.md", file=sys.stderr)
     elif a.cmd == "comments":
         comments(a.out, a.top, a.max)
     elif a.cmd == "report":
-        report(a.out, a.name, a.since)
+        print(report(a.out, a.name, a.since))
 
 
 if __name__ == "__main__":

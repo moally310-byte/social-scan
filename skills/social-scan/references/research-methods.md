@@ -43,9 +43,9 @@ Sources: YouTube via yt-dlp, top-sorted, up to `--max` per post. Instagram from 
 ## Competitor teardown (method only; no `compare` command yet)
 
 1. Confirm each handle belongs to the right brand before pulling; a shared name is not a match.
-2. Run each account into its own dated folder with the same `--limit` and `--since`.
+2. Run `scan` for each account into its own folder (`<project>/social-scan/<account>/<YYYY-MM-DD>/`) with the same `--limit` and `--yt-enrich`. For a date window, then run `report --out <DIR> --since YYYY-MM-DD` with the same date on each (`scan` has no `--since`).
 3. Compare from each `summary.json`: posts per week, median per group, **outlier rate** (share of baseline posts at 2x+), top 3 share, best format (the group with the most 2x+ posts), followers per 1K views. Never raw views across accounts.
-4. Run `hooks` on each and compare hook categories and channels across the top rows.
+4. Compare hook categories and channels across the top rows of each folder's `hooks.json`, which `scan` already built. Don't re-run `hooks` later: Instagram video links expire, and a re-run replaces those rows with failures.
 5. Output: snapshot table (account, platforms, audience, cadence, best format, notes) / what is working per account / cross-account patterns / gaps table (Opportunity, Evidence, Suggested test) / three content tests.
 
 ## The brief (`brief.md` beside `summary.md`)
