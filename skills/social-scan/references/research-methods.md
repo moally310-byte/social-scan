@@ -12,7 +12,16 @@ Read this after `report` when writing the brief, and before comparing accounts.
 - Confidence: low under 10 baseline posts (source: "do not overstate confidence from fewer than 10 posts"). Medium 10-19, high 20+ (ours: the source only says "pull at least 20").
 - Lift is within one account's group. Never rank raw views across accounts of different sizes, and never pool platforms into one baseline.
 - Pinned posts get a lift boost from placement; fresh posts are still climbing. Both are marked in the table.
-- Per-post `lift` is in `posts.csv` and `summary.json` for any other cut.
+- Per-post `lift` is in `posts.csv` and `summary.json` for any other cut. TikTok groups show their median share and save rates on a line of their own.
+
+## What formats work (built into `report`)
+
+- Each video group (TikTok videos, YouTube Shorts, YouTube long-form, Instagram reels) is cut three ways: length bucket, weekday and 3-hour posting block. Each row: posts, median views, median lift, share at 2x+. Settled, unpinned posts only (ours).
+- Rows under 5 posts are marked thin and never named strongest; a table whose every row is thin becomes one line; a group under 10 settled posts isn't cut (ours).
+- Posting times are exact or left out: TikTok, Instagram and Snapchat give one per post; YouTube's listing gives only a midnight guess, so only uploads looked up in the newest `--yt-enrich` run count. The extra top-post lookups are left out, since they're there for being hits. Times are shown in `--tz`, or this computer's zone.
+- **Check the length:** a weekday or time row can win on the length of the posts in it. When the strongest length is over-represented in the strongest day or time, the report gives that row's median lift without those posts. On the first live test, a creator's Saturday lead (6.1x) fell to 1.1x without its 3-10 minute clips.
+- Not cut: photo carousels (their listed length is the song's) and Snapchat (hidden view counts would tilt every row up; the Spotlight checks cover its length). Original vs named sound was tested and dropped: every named-sound post in the test sample was a carousel.
+- Correlation, not cause. In the brief, a strong row is a content test with its n quoted, not a schedule rule.
 
 ## Why it worked (the brief, written by Claude)
 
@@ -61,7 +70,7 @@ Scan the account into a new dated folder (`<project>/social-scan/<account>/<YYYY
 ## Repeatable patterns 2-4, each with evidence rows
 ## Hooks swipe file   verbatim, with channel + category + URL; top vs bottom contrast
 ## Comment themes     theme, bucket, frequency, intensity, exact quote
-## Content tests      3, each tied to an outlier or a comment theme
+## Content tests      3, each tied to an outlier, a comment theme or a format row (quote its n)
 ## Caveats            public data only, sample sizes, pinned/fresh, machine transcripts
 ```
 
