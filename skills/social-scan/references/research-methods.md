@@ -42,13 +42,13 @@ Sources: YouTube via yt-dlp, top-sorted, up to `--max` per post. Podcasts from A
 
 ## Monthly check-ins (built into `scan`)
 
-Scan the account into a new dated folder (`<project>/social-scan/<account>/<YYYY-MM-DD>/`) with the same `--limit` and `--yt-enrich` as last time. The report's "Since last scan" section then lists follower change, each group's median, cadence, 2x+ count and top-3 share then and now, the posts published since (with lift), the posts still climbing, and the ones that became outliers. Lead the check-in with what moved and why it likely moved; a median change in a group flagged "Different windows" is partly the window, not the content, and a gain marked ~ is approximate, give or take one rounding step.
+Scan the account into a new dated folder (`<project>/social-scan/<account>/<YYYY-MM-DD>/`) with the same `--days` as last time (or the same `--limit` and `--yt-enrich` if the last scan was by post count). The report's "Since last scan" section then lists follower change, each group's median, cadence, 2x+ count and top-3 share then and now, the posts published since (with lift), the posts still climbing, and the ones that became outliers. Lead the check-in with what moved and why it likely moved; a median change in a group flagged "Different windows" is partly the window, not the content, and a gain marked ~ is approximate, give or take one rounding step.
 
-## Competitor teardown (method only; no `compare` command yet)
+## Competitor teardown (`compare`)
 
 1. Confirm each handle belongs to the right brand before pulling; a shared name is not a match.
-2. Run `scan` for each account into its own folder (`<project>/social-scan/<account>/<YYYY-MM-DD>/`) with the same `--limit` and `--yt-enrich`. For a date window, then run `report --out <DIR> --since YYYY-MM-DD` with the same date on each (`scan` has no `--since`).
-3. Compare from each `summary.json`: posts per week, median per group, **outlier rate** (share of baseline posts at 2x+), top 3 share, best format (the group with the most 2x+ posts), followers per 1K views. Never raw views across accounts.
+2. Run `scan` for each account into its own folder (`<project>/social-scan/<account>/<YYYY-MM-DD>/`) with the same `--days` (a fixed `--limit` covers different date ranges at different cadences).
+3. Run `compare DIR DIR ...`: posts per week, median per group, **outlier rate** (share of settled posts at 2x+), top 3 share, best format (the group with the most 2x+ posts) and followers per 1K views, one row per account and format. Rows flagged under "Windows differ" have no median, and followers per 1K shows only for accounts scanned with the same `--days`: compare the rest on outlier rate and cadence. Never raw views across accounts.
 4. Compare hook categories and channels across the top rows of each folder's `hooks.json`, which `scan` already built. Don't re-run `hooks` later: Instagram video links expire, and a re-run replaces those rows with failures.
 5. Output: snapshot table (account, platforms, audience, cadence, best format, notes) / what is working per account / cross-account patterns / gaps table (Opportunity, Evidence, Suggested test) / three content tests.
 
