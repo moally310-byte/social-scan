@@ -6,6 +6,8 @@ Backends
                       followers and photo carousels from the public pages
   Snapchat         -> the public profile page (logged out, no cookies): the
                       newest Spotlights it lists, with no logged-out paging
+  Podcast          -> Apple's Search API, chart and review feeds, Spotify's
+                      podcast charts and the show's own RSS feed (all free)
   Instagram        -> Apify REST (`scan --instagram` or `collect --instagram`,
                       APIFY_TOKEN from the environment) or Apify MCP dataset
                       JSON via `ingest-ig`
@@ -13,7 +15,7 @@ Backends
 Start here
   doctor     [--get-model]   what's installed, what each missing piece turns off,
                              and the install line for macOS and Linux
-  scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--name N]
+  scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--name N]
              [--tiktok-followers N] [--limit N] [--yt-enrich N] [--no-hooks] [--no-comments]
                              collect, hooks, comments and report in one go;
                              a step whose tool is missing is skipped with a note.
@@ -21,7 +23,7 @@ Start here
                              everything already in it.
 
 Single steps
-  collect    --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--limit N] [--yt-enrich N]
+  collect    --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--limit N] [--yt-enrich N]
   ingest-ig  --out DIR (--reels reels.json | --posts posts.json) [--profile profile.json]
   meta       --out DIR --platform P --followers N [--following N] [--source TEXT]
   hooks      --out DIR [--top N] [--bottom N] [--seconds S]
@@ -103,19 +105,49 @@ def ytdlp_json(url, extra=(), flat=True, timeout=300):
         raise RuntimeError("yt-dlp returned unreadable output (an old yt-dlp is the usual cause; `doctor` checks its age)")
 
 
-def page_json(url, script_id, timeout=30):
-    """The JSON a public page embeds in <script id=script_id>, fetched logged out with no cookies."""
+def fetch(url, accept=None, timeout=30, max_bytes=60_000_000):
+    """A public URL's bytes, logged out with no cookies. Every failure becomes RuntimeError."""
     import http.client
     import urllib.error
     import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+    if not str(url).lower().startswith(("http://", "https://")):  # never a local file from someone's catalog entry
+        raise RuntimeError(f"bad URL {url!r} (only http and https are read)")
+    headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+    if accept:
+        headers["Accept"] = accept
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            html = r.read().decode("utf-8", "replace")
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
+            chunks, n = [], 0
+            while n <= max_bytes:  # 1 MB at a time, so no read allocates the whole cap up front
+                b = r.read(min(1 << 20, max_bytes + 1 - n))
+                if not b:
+                    break
+                chunks.append(b)
+                n += len(b)
+            if r.length and n <= max_bytes:  # read(amt) hands back a cut-off body without raising
+                raise http.client.IncompleteRead(b"".join(chunks), r.length)
+            data = b"".join(chunks)
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code} from {url}")
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # incl. a cut-off read
         raise RuntimeError(f"couldn't reach {url} ({getattr(e, 'reason', None) or type(e).__name__})")
+    except ValueError as e:  # a malformed URL from a catalog or a redirect (no scheme, non-ASCII)
+        raise RuntimeError(f"bad URL {url!r} ({type(e).__name__})")
+    if len(data) > max_bytes:
+        raise RuntimeError(f"{url} sent more than {max_bytes // 1_000_000} MB")
+    return data
+
+
+def fetch_json(url, accept="application/json"):
+    try:
+        return json.loads(fetch(url, accept=accept))
+    except ValueError:
+        raise RuntimeError(f"{url} sent unreadable JSON")
+
+
+def page_json(url, script_id, timeout=30):
+    """The JSON a public page embeds in <script id=script_id>, fetched logged out with no cookies."""
+    html = fetch(url, timeout=timeout).decode("utf-8", "replace")
     m = re.search(rf'<script id="{script_id}"[^>]*>(.*?)</script>', html, re.S)
     if not m:
         raise RuntimeError(f"{url} has no {script_id} data (blocked, changed, or not a public page)")
@@ -347,6 +379,477 @@ def collect_tiktok(handle, out, limit, quiet_followers=False):
              "" if quiet_followers else f"; add followers with: python3 {here()} meta --out {shlex.quote(out)} "
              "--platform tiktok --followers N"), file=sys.stderr)
     return info
+
+
+# Apple's top-level podcast genres and their Spotify chart slugs (Spotify has no
+# Government or Kids & Family chart). Apple ids from its genre service, Spotify
+# slugs from podcastcharts.byspotify.com, both checked 2026-10-16.
+APPLE_TO_SPOTIFY = {"1301": "arts", "1321": "business", "1303": "comedy", "1304": "education", "1483": "fiction",
+                    "1512": "health-fitness", "1487": "history", "1502": "leisure", "1310": "music", "1489": "news",
+                    "1314": "religion-spirituality", "1533": "science", "1324": "society-culture", "1545": "sports",
+                    "1309": "tv-film", "1318": "technology", "1488": "true-crime"}
+
+
+SPOTIFY_NAMES = {"health-fitness": "Health & Fitness", "religion-spirituality": "Religion & Spirituality",
+                 "society-culture": "Society & Culture", "tv-film": "TV & Film"}
+
+
+def norm_name(x):
+    """A show name for matching: its letters (with their combining vowel and tone
+    marks) and digits in any script, NFKC-folded and lowercased, after dropping
+    emoji and symbols first (so "3 Takeaways™" still matches "3 Takeaways", and
+    "MBC 라디오" doesn't match "MBC 뉴스"). An empty result never counts as a match."""
+    import unicodedata
+
+    def keep(c):  # variation selectors (an emoji's U+FE0F) are marks too, but not part of a name
+        return c.isalnum() or (unicodedata.category(c) in ("Mn", "Mc") and not "\ufe00" <= c <= "\ufe0f"
+                               and not "\U000e0100" <= c <= "\U000e01ef")
+    x = "".join(c for c in str(x or "") if not unicodedata.category(c).startswith("S"))
+    return "".join(c for c in unicodedata.normalize("NFKC", x).casefold() if keep(c))
+
+
+def spotify_rank(rows, name):
+    """(rank, row) of a show in a Spotify chart, matched by name: exactly once
+    normalized, else with a leading "The" dropped on both sides ("The Dan Bongino
+    Show" is "Dan Bongino Show" there). (None, {}) when it isn't listed."""
+    key = norm_name(name)
+    if not key:
+        return None, {}
+    for loose in (False, True):
+        strip = (lambda k: re.sub(r"^the(?=.)", "", k)) if loose else (lambda k: k)
+        for i, r in enumerate(rows):  # the rank is the position in the chart as sent
+            k = norm_name(r.get("showName")) if isinstance(r, dict) else ""
+            if k and strip(k) == strip(key):
+                return i + 1, r
+    return None, {}
+
+
+def apple_id(q):
+    """The show ID in a podcasts.apple.com link, an "id123" token or plain ASCII digits; else None."""
+    m = re.search(r"(?:^|/)id(\d{1,20})(?:$|[/?#])", q)
+    if m:
+        return str(int(m.group(1)))  # int() reads any script's digits; the URL gets ASCII
+    return q if q.isascii() and q.isdigit() else None
+
+
+def ld_json(html):
+    """The schema.org objects a page embeds in <script type="application/ld+json">."""
+    out = []
+    for m in re.finditer(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
+        try:
+            d = json.loads(m.group(1))
+        except ValueError:
+            continue
+        out += d if isinstance(d, list) else [d]
+    return [d for d in out if isinstance(d, dict)]
+
+
+def app_ratings(html, cid):
+    """This show's ratings record in the show page's app data: {"total": N,
+    "counts": {"5": .., "1": ..}}, counts None unless they add up to N; None
+    when the page has no record for this show."""
+    for m in re.finditer(r'\{[^{}]*"totalNumberOfRatings":\d+[^{}]*\}', html):
+        try:
+            d = json.loads(m.group(0))
+        except ValueError:
+            continue
+        total, c = d.get("totalNumberOfRatings"), d.get("ratingCounts")
+        if str(d.get("productId")) != cid or not isinstance(total, int) or total < 0:
+            continue
+        ok = isinstance(c, list) and len(c) == 5 and all(isinstance(x, int) and x >= 0 for x in c) and sum(c) == total
+        return {"total": total, "counts": dict(zip(("5", "4", "3", "2", "1"), c)) if ok and total else None}
+    return None
+
+
+def podcast_secs(v):
+    """itunes:duration as seconds: "02:17:27", "45:10" or "7244"."""
+    try:
+        parts = [int(float(x)) for x in str(v).strip().split(":")]
+    except (ValueError, OverflowError):  # "inf" and "1e999" overflow int()
+        return None
+    if not parts or len(parts) > 3 or min(parts) < 0:
+        return None
+    sec = 0
+    for x in parts:
+        sec = sec * 60 + x
+    return sec or None
+
+
+def hms(sec):
+    return f"{sec // 3600}h{sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60}m"
+
+
+def no_dtd(data):
+    """Refuse XML with an inline DTD before ElementTree sees it: that's where
+    entity declarations (billion laughs) and attribute defaults (copied onto
+    every element) live, and podcast feeds don't need one. expat finds the
+    prolog itself, so padding can't hide one; an external DTD is never loaded."""
+    import xml.parsers.expat
+
+    class Done(Exception):
+        pass
+
+    def doctype(name, sysid, pubid, internal):
+        if internal:
+            raise RuntimeError("the feed has an inline DTD (entities or attribute defaults), so it wasn't parsed")
+
+    def decl(*_):  # a backstop: declarations only occur inside an inline DTD
+        raise RuntimeError("the feed declares XML entities, so it wasn't parsed")
+
+    def start(*_):
+        raise Done  # the root element has started: no declarations can follow
+
+    p = xml.parsers.expat.ParserCreate()
+    p.StartDoctypeDeclHandler, p.EntityDeclHandler, p.StartElementHandler = doctype, decl, start
+    try:
+        p.Parse(data, True)
+    except (Done, xml.parsers.expat.ExpatError):  # ElementTree reports a malformed feed itself
+        pass
+
+
+def podcast_feed(url):
+    """Episode cadence and length from the show's own RSS feed."""
+    import email.utils
+    import io
+    import xml.etree.ElementTree as ET
+    data = fetch(url, accept="application/rss+xml, application/xml, text/xml")
+    no_dtd(data)
+    duration = "{http://www.itunes.com/dtds/podcast-1.0.dtd}duration"
+    eps = []
+    try:
+        for _, el in ET.iterparse(io.BytesIO(data)):
+            if el.tag != "item":
+                continue
+            when = None
+            try:
+                when = email.utils.parsedate_to_datetime(el.findtext("pubDate") or "")
+            except (TypeError, ValueError, IndexError, OverflowError):
+                pass
+            if when and when.tzinfo is None:
+                when = when.replace(tzinfo=dt.timezone.utc)
+            eps.append({"date": when, "secs": podcast_secs(el.findtext(duration) or "")})
+            el.clear()  # keep memory flat on a big feed
+    except ET.ParseError as e:
+        raise RuntimeError(f"the feed isn't readable XML ({e})")
+    soon = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+    dated = sorted((e for e in eps if e["date"]), key=lambda e: e["date"], reverse=True)
+    future = sum(1 for e in dated if e["date"] > soon)  # trailers pinned ahead, typo'd years
+    dated = [e for e in dated if e["date"] <= soon]
+    local = lambda d: d.astimezone().date()  # local dates, like TODAY
+    out = {"episodes": len(eps), "newest": local(dated[0]["date"]).isoformat() if dated else None}
+    if future:
+        out["future_dated"] = future
+    if dated:
+        # 12 hours off the 8-weeks-ago slot, so a few minutes or a clock change can't add an episode
+        cut = dated[0]["date"] - dt.timedelta(weeks=8) + dt.timedelta(hours=12)
+        recent = [e for e in dated if e["date"] > cut]
+        old = dated[len(recent):]
+        if 0 < len(old) <= 2:  # a trailer or two pinned far behind a feed that keeps only recent episodes
+            gaps = [(a["date"] - b["date"]).total_seconds() / 86400 for a, b in zip(recent, recent[1:])]
+            jump = (recent[-1]["date"] - old[0]["date"]).total_seconds() / 86400
+            if jump > max(14, 4 * statistics.median(gaps) if gaps else 0):
+                out["left_out_old"], out["left_out_oldest"] = len(old), local(old[-1]["date"]).isoformat()
+                out["left_out_dates"] = sorted(local(e["date"]).isoformat() for e in old)
+                dated = recent
+        lens = [e["secs"] for e in recent if e["secs"]]
+        if dated[-1]["date"] > cut:  # the feed starts inside the window: a new show or a trimmed feed
+            span = (dated[0]["date"] - dated[-1]["date"]).total_seconds() / 86400
+            out["window_from"] = local(dated[-1]["date"]).isoformat()
+            # like the posts' cadence: no rate under 14 days, and N episodes span N - 1 gaps
+            weeks, per_week = (round(span / 7, 1), round((len(recent) - 1) / (span / 7), 1)) if span >= 14 else (None, None)
+        else:
+            weeks, per_week = 8, round(len(recent) / 8, 1)
+        out.update(window_weeks=weeks, in_window=len(recent), per_week=per_week,
+                   median_secs=int(statistics.median(lens)) if lens else None)
+    return out
+
+
+def why(e):
+    return str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
+
+
+def collect_podcast(query, out):
+    """A podcast's Apple and Spotify chart ranks, Apple rating and reviews, and
+    episode cadence: about a dozen requests to free public endpoints. Each
+    source that fails becomes a line in errors; only finding the show is fatal."""
+    import urllib.parse
+    q, info, errors = str(query).strip(), {}, []
+    aid = apple_id(q)
+    if not aid and ("://" in q or "podcasts.apple.com" in q.lower()):
+        raise RuntimeError(f"{q!r} is a link with no show ID in it: pass the digits after 'id' in the show's "
+                           "podcasts.apple.com link")
+
+    def results(url):
+        d = fetch_json(url)
+        rows = d.get("results") if isinstance(d, dict) else None
+        return [r for r in rows or [] if isinstance(r, dict) and r.get("collectionId")]
+
+    res, matched, also = [], "Apple ID", []
+    if aid:
+        d = fetch_json(f"https://itunes.apple.com/lookup?id={aid}&entity=podcast")
+        rows = [r for r in (d.get("results") if isinstance(d, dict) else None) or [] if isinstance(r, dict)]
+        res = [r for r in rows if str(r.get("collectionId")) == str(int(aid))]  # "042" is show 42
+        if not res and rows:  # a publisher's ID: Apple lists the publisher, then its shows
+            shows = [r for r in rows if r.get("collectionId")]
+            pub = rows[0].get("artistName") or (shows[0].get("artistName") if shows else None) or "?"
+            raise RuntimeError(f"{aid} is a publisher's Apple ID ({pub}), "
+                               "not a show's" + (": its shows include " + ", ".join(
+                                   f"{r.get('collectionName')!r} ({r['collectionId']})" for r in shows[:3]) if shows else "")
+                               + ". Pass the show's own ID, the digits after 'id' in its podcasts.apple.com/…/podcast/… link")
+        if not res and aid != q:
+            raise RuntimeError(f"no podcast on Apple Podcasts has the ID {aid}")
+    if not res:  # a name, or digits that aren't an ID (a show called "1619")
+        found = results("https://itunes.apple.com/search?" + urllib.parse.urlencode(
+            {"term": q, "entity": "podcast", "limit": 10}))
+        key = norm_name(q)
+        exact = [r for r in found if key and norm_name(r.get("collectionName")) == key]
+        if aid and not exact:
+            raise RuntimeError(f"no podcast on Apple Podcasts has the ID or the name {q!r}")
+        res, also = exact or found, exact[1:]
+        matched = ("exact name" if len(exact) == 1 else f"exact name, shared by {len(exact)} shows") if exact \
+            else "search, first result"
+    if not res:
+        raise RuntimeError(f"no podcast found on Apple Podcasts for {q!r} (check the name, or pass its Apple ID: "
+                           "the digits after 'id' in its podcasts.apple.com link)")
+    show = res[0]
+    cid = str(show["collectionId"])
+    if matched.startswith("search"):
+        info["note"] = (f"podcast: {q!r} matched {show.get('collectionName')!r} by search; pass --podcast {cid} "
+                        "to pin the show")
+    elif also:
+        info["note"] = (f"podcast: {len(also) + 1} shows on Apple are named {show.get('collectionName')!r}; used {cid} "
+                        f"by {show.get('artistName') or '?'}; others: "
+                        + ", ".join(f"{r['collectionId']} by {r.get('artistName') or '?'}" for r in also)
+                        + ". Pass --podcast ID to pin the right one (Spotify ranks are matched by name too)")
+    save(os.path.join(out, "raw", "podcast_lookup.json"), show)
+    gids = [str(g) for g in (show.get("genreIds") or []) if str(g) != "26"]  # 26 is "Podcasts" itself
+    gnames = dict(zip((str(g) for g in show.get("genreIds") or []), show.get("genres") or []))
+    charts = []
+    for gid in gids + [""]:  # each of the show's genres, then all podcasts
+        label = gnames.get(gid, "All podcasts") if gid else "All podcasts"
+        try:
+            d = fetch_json("https://itunes.apple.com/us/rss/toppodcasts/limit=200" + (f"/genre={gid}" if gid else "") + "/json")
+            entries = ((d.get("feed") or {}).get("entry") if isinstance(d, dict) else None) or []
+            entries = [e for e in (entries if isinstance(entries, list) else [entries]) if isinstance(e, dict)]
+            if not entries:
+                raise RuntimeError("empty or unexpected response")
+            ids = [str(((e.get("id") or {}).get("attributes") or {}).get("im:id")) if isinstance(e.get("id"), dict)
+                   else None for e in entries]
+            charts.append({"source": "Apple", "chart": label, "size": len(entries),
+                           "rank": ids.index(cid) + 1 if cid in ids else None, "move": None})
+        except Exception as e:  # one chart failing leaves the rest
+            errors.append(f"Apple chart {label}: {why(e)}")
+    slugs = ["top-podcasts", "trending"] + sorted({APPLE_TO_SPOTIFY[g] for g in gids if g in APPLE_TO_SPOTIFY})
+    for slug in slugs:
+        label = SPOTIFY_NAMES.get(slug, slug.replace("-", " ").title())
+        try:
+            rows = fetch_json(f"https://podcastcharts.byspotify.com/api/charts/{slug}?region=us&limit=100")
+            if not isinstance(rows, list) or not rows:
+                raise RuntimeError("empty or unexpected response")
+            rank, row = spotify_rank(rows, show.get("collectionName"))
+            move = row.get("chartRankMove")
+            charts.append({"source": "Spotify", "chart": label, "size": len(rows), "rank": rank,
+                           "move": move.lower() if isinstance(move, str) and move else None})
+        except Exception as e:
+            errors.append(f"Spotify chart {label}: {why(e)}")
+    rating = ratings = counts = None
+    featured = []
+    try:
+        html = fetch(f"https://podcasts.apple.com/us/podcast/id{cid}").decode("utf-8", "replace")
+        series = next((d for d in ld_json(html) if d.get("aggregateRating") or d.get("review")), {})
+        agg = series.get("aggregateRating")
+        agg = agg if isinstance(agg, dict) else {}
+        rating, ratings = agg.get("ratingValue"), num(agg.get("reviewCount"))  # reviewCount is the ratings count
+        rating = float(rating) if isinstance(rating, (int, float)) else None
+        app = app_ratings(html, cid)
+        counts = app["counts"] if app and ratings and app["total"] == ratings else None
+        reviews_ld = series.get("review")
+        for r in reviews_ld if isinstance(reviews_ld, list) else []:  # the ones Apple shows on the page; no names
+            if isinstance(r, dict):
+                stars = r.get("reviewRating")
+                featured.append({"rating": num(stars.get("ratingValue")) if isinstance(stars, dict) else None,
+                                 "title": r.get("name"), "text": r.get("reviewBody"),
+                                 "date": str(r.get("datePublished") or "")[:10] or None})
+        if rating is None:
+            series_types = ("CreativeWorkSeries", "PodcastSeries")
+            # the page's own ratings record decides; the schema.org data only when there's no record
+            if (app["total"] == 0 if app is not None else
+                    any(d.get("@type") in series_types and not d.get("aggregateRating") for d in ld_json(html))):
+                ratings = 0  # a show nobody has rated yet, not a page the script couldn't read
+            else:
+                errors.append("Apple show page: no rating found")
+    except Exception as e:
+        errors.append(f"Apple show page: {why(e)}")
+    reviews, empty, last_full, failed, seen = [], [], 0, None, set()
+    lab = lambda e, k: e[k].get("label") if isinstance(e.get(k), dict) else None
+    for page in range(1, 11):  # 50 a page; Apple serves some pages empty, so stop after two in a row
+        try:
+            d = fetch_json(f"https://itunes.apple.com/us/rss/customerreviews/page={page}/id={cid}/sortby=mostrecent/json")
+            entries = ((d.get("feed") or {}).get("entry") if isinstance(d, dict) else None) or []
+            entries = [e for e in (entries if isinstance(entries, list) else [entries])
+                       if isinstance(e, dict) and isinstance(e.get("im:rating"), dict)]
+        except Exception as e:
+            errors.append(f"Apple reviews page {page}: {why(e)}")
+            failed = page
+            break
+        if not entries:
+            empty.append(page)
+            if empty[-2:] == [page - 1, page]:
+                break
+            continue
+        last_full = page
+        for e in entries:  # rating, title, text and date only: no reviewer names
+            rid = lab(e, "id")
+            if rid and rid in seen:  # one review can sit on two pages
+                continue
+            seen.add(rid)
+            reviews.append({"rating": num(lab(e, "im:rating")), "title": lab(e, "title"),
+                            "text": lab(e, "content"), "date": str(lab(e, "updated") or "")[:10] or None})
+    holes = [x for x in empty if x < last_full]
+    notes = []
+    if 1 in holes:  # the newest 50 are missing: the show page's reviews are the recent ones left
+        feed_end = max((r["date"] for r in reviews if r["date"]), default="?")
+        key = lambda r: (str(r["title"] or "").strip().casefold(), str(r["text"] or "").strip().casefold())
+        have = {key(r) for r in reviews}  # not the date: the page's and the feed's differ by a day across zones
+        add = [r for r in featured if key(r) not in have]
+        reviews += add
+        notes.append(f"page 1, its newest 50, came back empty, so its reviews end {feed_end}"
+                     + (f"; the {len(add)} review{'' if len(add) == 1 else 's'} on Apple's US show page "
+                        f"{'are' if len(add) > 1 else 'is'} added" if add else ""))
+    rest = [str(x) for x in holes if x != 1]
+    if rest:
+        notes.append(f"page{'s' if len(rest) > 1 else ''} {', '.join(rest)} came back empty, so some reviews in "
+                     "between are missing")
+    if failed and reviews:
+        notes.append(f"page {failed} failed")
+    reviews.sort(key=lambda r: r["date"] or "", reverse=True)
+    source = "Apple's US review feed, newest first" + (f" ({'; '.join(notes)})" if notes else "")
+    if not reviews and featured:  # the review feed can answer with nothing at all
+        reviews, source = featured, ("the reviews Apple shows on its US show page (its review feed "
+                                     + ("failed" if failed else "came back empty") + ")")
+    elif not reviews:
+        source = None
+    feed = None
+    if show.get("feedUrl"):
+        try:
+            feed = podcast_feed(show["feedUrl"])
+        except Exception as e:
+            errors.append(f"RSS feed: {why(e)}")
+    stars = {str(k): sum(1 for r in reviews if r["rating"] == k) for k in range(5, 0, -1)}
+    pod = {"pulled": TODAY.isoformat(), "query": q, "matched_by": matched, "apple_id": cid,
+           "name": show.get("collectionName"), "publisher": show.get("artistName"),
+           "also_named": [{"apple_id": str(r["collectionId"]), "publisher": r.get("artistName"),
+                           "episodes": r.get("trackCount")} for r in also],
+           "genres": [gnames.get(g) for g in gids], "episodes_listed": show.get("trackCount"),
+           "apple_url": f"https://podcasts.apple.com/us/podcast/id{cid}", "feed_url": show.get("feedUrl"),
+           "rating": rating, "ratings": ratings, "rating_counts": counts, "charts": charts, "feed": feed,
+           "reviews": {"read": len(reviews), "source": source,
+                       "newest": max((r["date"] for r in reviews if r["date"]), default=None), "stars": stars},
+           "errors": errors}
+    save(os.path.join(out, "podcast.json"), pod)
+    save(os.path.join(out, "reviews_apple.json"), reviews)
+    ranked = [f"{c['source']} {c['chart']} #{c['rank']}" for c in charts if c["rank"]]
+    print(f"  podcast: {pod['name']} ({matched}); " + (", ".join(ranked) if ranked else "not in any chart checked")
+          + (f"; {rating} from {ratings:,} US rating{'' if ratings == 1 else 's'}" if rating and ratings else "; no US ratings yet" if ratings == 0 else "") + f"; {len(reviews)} review{'' if len(reviews) == 1 else 's'} read"
+          + (f"; {len(errors)} source{'' if len(errors) == 1 else 's'} failed" if errors else ""), file=sys.stderr)
+    info["errors"] = errors
+    info["name"] = pod["name"]
+    return info
+
+
+def podcast_section(out):
+    pod = load(os.path.join(out, "podcast.json"))
+    if not pod:
+        return []
+    try:
+        pulled = dt.date.fromisoformat(pod["pulled"])
+    except (KeyError, TypeError, ValueError):
+        pulled = None
+    L = ["## Podcast",
+         f"**[{pod['name']}]({pod['apple_url']})**" + (f" by {pod['publisher']}" if pod.get("publisher") else "")
+         + (f" ({', '.join(g for g in pod.get('genres') or [] if g)})" if pod.get("genres") else "")
+         + (f": rated {pod['rating']} from {pod['ratings']:,} US rating{'' if pod['ratings'] == 1 else 's'} on Apple Podcasts"
+            if pod.get("rating") and pod.get("ratings")
+            else ": no ratings yet on Apple Podcasts (US store)" if pod.get("ratings") == 0 else "")
+         + (f"; {pod['episodes_listed']:,} episode{'' if pod['episodes_listed'] == 1 else 's'} listed"
+            if pod.get("episodes_listed") else "") + "."]
+    rc = pod.get("rating_counts")
+    if rc and sum(rc.values()) > 1:  # with one rating the header already says it
+        n = sum(rc.values())
+        L.append(f"All {n:,} US Apple ratings: " + " · ".join(f"{k}★ {rc.get(k, 0) / n:.0%}" for k in ("5", "4", "3", "2", "1")) + ".")
+    if pulled and pulled != TODAY:
+        L.append(f"These podcast numbers are from {pulled}; run scan with --podcast again to refresh them.")
+    also = pod.get("also_named") or []
+    if also:
+        L.append(f"{len(also) + 1} shows on Apple share this name; this is Apple ID {pod['apple_id']}. Others: "
+                 + ", ".join(f"{a['apple_id']} by {a.get('publisher') or '?'}" for a in also)
+                 + ". Check it's the right show; Spotify ranks are matched by name, so they could belong to another.")
+    elif str(pod.get("matched_by", "")).startswith("search"):
+        L.append(f"Matched by search for \"{pod['query']}\": check it's the right show (Apple ID {pod['apple_id']}).")
+    if pod.get("charts"):
+        L += ["", f"**Charts** (US, as of {pod['pulled']}; positions move daily)", "| Chart | Rank |", "|---|---|"]
+        for c in pod["charts"]:
+            where = (f"#{c['rank']} of {c['size']}" + (f" ({c['move']})" if c.get("move") else "")) if c["rank"] else \
+                f"not in the top {c['size']}" if c.get("size") else "couldn't read"
+            L.append(f"| {c['source']} {c['chart']} | {where} |")
+        L += ["", "Not in a chart means outside its top N, which is weak evidence on its own. Spotify rows are matched "
+                  "by show name, so a show Spotify lists under another name reads as not in its charts."]
+    f = pod.get("feed") or {}
+    if f.get("episodes"):
+        ago = ""
+        try:
+            newest = dt.date.fromisoformat(f["newest"])
+        except (KeyError, TypeError, ValueError):
+            newest = None
+        if newest and pulled:
+            days, later = (pulled - newest).days, pulled != TODAY
+            if days < 0:  # the feed allows items up to a day ahead
+                ago = f" (dated after the {pulled} pull)" if later else " (dated ahead of today)"
+            elif days == 0:
+                ago = f" (the {pulled} pull day)" if later else " (today)"
+            elif later:
+                ago = f" ({days} day{'' if days == 1 else 's'} before the {pulled} pull)"
+            else:
+                ago = " (yesterday)" if days == 1 else f" ({days} days ago)"
+        if f.get("per_week") is not None and f.get("window_weeks") == 8:
+            rate = f"; {f['per_week']} a week over the 8 weeks before the newest episode"
+        elif f.get("per_week") is not None:
+            rate = (f"; {f['per_week']} a week over the {f['window_weeks']:g} weeks "
+                    + (f"since {f['window_from']}" if f.get("window_from") else "the feed covers"))
+        elif f.get("window_from"):
+            n = f.get("in_window")
+            rate = (f"; no weekly rate from one episode ({f['window_from']})" if n == 1 else
+                    f"; no weekly rate: its {n if n is not None else '?'} newest episodes span under two weeks "
+                    f"(since {f['window_from']})")
+        else:
+            rate = ""
+        L += ["", f"**Episodes:** {f['episodes']:,} in the feed, newest {f.get('newest') or '?'}{ago}{rate}"
+              + (f", median length {hms(f['median_secs'])}" if f.get("median_secs") else "") + "."]
+        if f.get("left_out_old"):
+            k = f["left_out_old"]
+            when = " and ".join(f.get("left_out_dates") or [f.get("left_out_oldest") or "?"])
+            L.append(f"{k} older feed item{'s' if k > 1 else ''} (from {when}) "
+                     f"{'come' if k > 1 else 'comes'} long before the rest, so the cadence leaves "
+                     f"{'them' if k > 1 else 'it'} out.")
+        if f.get("future_dated"):
+            L.append(f"{f['future_dated']} feed item{'s are' if f['future_dated'] > 1 else ' is'} dated in the future "
+                     "and left out of the cadence.")
+        listed = pod.get("episodes_listed") or 0
+        if listed - f["episodes"] >= 10 and f["episodes"] < 0.8 * listed:  # a trimmed or paywalled public feed
+            L.append(f"The public feed carries {f['episodes']:,} of the {listed:,} episodes Apple lists, so cadence and "
+                     "length here may not match the show's real schedule.")
+    r = pod.get("reviews") or {}
+    if r.get("read"):
+        st = r.get("stars") or {}
+        L += ["", f"**Apple reviews (US):** {r['read']} read from {r.get('source') or 'Apple'}"
+              + (f"; newest {r['newest']}" if r.get("newest") else "")
+              + f". Stars in {'this one' if r['read'] == 1 else 'these ' + str(r['read'])}: " + " · ".join(f"{k}★ {st.get(k, 0)}" for k in ("5", "4", "3", "2", "1"))
+              + ". Most ratings come without a written review, so this is a sample, not the rating. Text and dates "
+              "are in reviews_apple.json for comment mining; reviewer names aren't kept."]
+    if pod.get("errors"):
+        L += ["", "Couldn't read: " + "; ".join(pod["errors"]) + "."]
+    L.append("")
+    return L
 
 
 def snap_seo_keywords(m):
@@ -1303,7 +1806,12 @@ def spotlight_checks(posts, meta):
 def report(out, name, since, note=None):
     all_posts, metas, undated_dropped = load_posts(out, since)
     if not all_posts:
-        sys.exit("No posts found. Run collect / ingest-ig first.")
+        total = len(load_posts(out)[0]) if since else 0
+        if total:  # the folder has posts, the date window has none: write nothing
+            sys.exit(f"No posts since {since} ({total} in the folder), so nothing was written. Check the date, "
+                     "or leave out --since.")
+        if not os.path.exists(os.path.join(out, "podcast.json")):
+            sys.exit("No posts found. Run collect / ingest-ig first.")
     groups = build_groups(all_posts, metas)
 
     with open(os.path.join(out, "posts.csv"), "w", newline="") as f:
@@ -1315,18 +1823,24 @@ def report(out, name, since, note=None):
         for p in sorted(all_posts, key=lambda p: (p["platform"], p.get("date") or ""), reverse=True):
             w.writerow(p)
 
+    if not name and not all_posts:  # a podcast-only folder
+        name = (load(os.path.join(out, "podcast.json")) or {}).get("name")
     L = [f"# Social scan: {name or os.path.basename(os.path.abspath(out))}",
-         f"Pulled {TODAY.isoformat()} from public, logged-out data. {len(all_posts)} posts"
-         + (f" since {since}." if since else "."), ""]
+         f"Pulled {TODAY.isoformat()} from public, logged-out data."
+         + ((f" {len(all_posts)} posts" + (f" since {since}." if since else ".")) if all_posts else ""), ""]
 
-    L += ["## Accounts", "| Platform | Followers | Following | Source |", "|---|---|---|---|"]
-    for plat in ("instagram", "tiktok", "youtube", "snapchat"):
-        m = metas.get(plat)
-        if m:
-            src = m.get("source", "") + (f", pulled {m['pulled']}" if m.get("pulled") else "")
-            L.append(f"| {plat} | {fmt(m.get('followers'))} | {fmt(m.get('following'))} | {src} |")
-    L.append("")
+    if metas:
+        L += ["## Accounts", "| Platform | Followers | Following | Source |", "|---|---|---|---|"]
+        for plat in ("instagram", "tiktok", "youtube", "snapchat"):
+            m = metas.get(plat)
+            if m:
+                src = m.get("source", "") + (f", pulled {m['pulled']}" if m.get("pulled") else "")
+                L.append(f"| {plat} | {fmt(m.get('followers'))} | {fmt(m.get('following'))} | {src} |")
+        L.append("")
 
+    L += podcast_section(out)
+    if not all_posts:
+        return finish_report(out, name, L, groups, all_posts, metas)
     L += ["## Scorecard",
           "| Group | Posts | Per week | Median views | Max | Top 3 share | Outliers 5x+ / 2-5x / 1.5-2x | Confidence | Like rate (n) | Comment rate | Followers per 1K views (proxy) |",
           "|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -1458,15 +1972,20 @@ def report(out, name, since, note=None):
           "Photos and carousels aren't sampled. Pinned posts are shown but kept out of every window figure "
           "(reports before 2026-10-15 counted them in the median).",
           "- Reach, follows per post, retention and ad spend need the client's own analytics access."]
+    return finish_report(out, name, L, groups, all_posts, metas)
 
+
+def finish_report(out, name, L, groups, all_posts, metas):
     with open(os.path.join(out, "summary.md"), "w") as f:
         f.write("\n".join(L) + "\n")
     slim = [{k: v for k, v in s.items() if k not in ("top", "bottom", "outliers", "duds")} for _, s in groups]
     lifts = [{k: p.get(k) for k in ("platform", "group", "id", "url", "date", "date_approx", "views", "lift", "tier",
                                     "eng_lift", "pinned")}
              for p in all_posts if p.get("lift") is not None]
+    pod = load(os.path.join(out, "podcast.json"))
     save(os.path.join(out, "summary.json"), {"pulled": TODAY.isoformat(), "name": name, "accounts": metas,
-                                             "groups": slim, "posts": lifts})
+                                             "groups": slim, "posts": lifts,
+                                             **({"podcast": {k: v for k, v in pod.items() if k != "errors"}} if pod else {})})
     return os.path.join(out, "summary.md")
 
 
@@ -1637,6 +2156,7 @@ def doctor(get_model_too):
     else:
         print("Hooks: caption's first line only; no first frame, no spoken hook.")
     print("Snapchat: ready (free, logged out; the newest Spotlights the profile page lists).")
+    print("Podcast: ready (free: Apple and Spotify charts, Apple rating and reviews, the show's RSS feed).")
     print("Instagram: " + (f"ready (paid per use through Apify: about $0.11 per 40 reels, capped at ${IG_MAX_USD:.2f} per call)."
                            if "APIFY_TOKEN" in ok else
                            "off (optional; paid per use through Apify, about $0.11 per 40 reels; set APIFY_TOKEN to turn it on)."))
@@ -1721,9 +2241,20 @@ def scan(a):
 
     todo = [(p, h) for p, h in (("youtube", a.youtube), ("tiktok", a.tiktok), ("instagram", a.instagram),
                                 ("snapchat", a.snapchat)) if h]
-    if not todo and not load_posts(a.out)[0]:
-        sys.exit("scan needs --youtube, --tiktok, --instagram or --snapchat (or an --out folder that already holds "
-                 "collected posts)")
+    pod_info = {}
+    if not todo and not a.podcast and not load_posts(a.out)[0] and not os.path.exists(os.path.join(a.out, "podcast.json")):
+        sys.exit("scan needs --youtube, --tiktok, --instagram, --snapchat or --podcast (or an --out folder that "
+                 "already holds collected posts)")
+    if a.podcast:
+        ran.append("podcast")
+        try:
+            pod_info = collect_podcast(a.podcast, a.out)
+            if pod_info.get("note"):
+                note(pod_info["note"])
+            for err in pod_info.get("errors") or []:
+                note(f"podcast: couldn't read {err}")
+        except Exception as e:
+            note(f"podcast failed: {e}")
     rp = os.path.join(a.out, "raw", "instagram_reels.json")
     for plat, h in todo:
         if plat in ("youtube", "tiktok") and not shutil.which(YTDLP):
@@ -1761,7 +2292,7 @@ def scan(a):
         fresh = os.path.exists(mp) and os.path.getmtime(mp) >= t0
         save(mp, {"followers": a.tiktok_followers, "following": old.get("following") if fresh else None,
                   "source": "tiktok profile page (scan --tiktok-followers)", "pulled": TODAY.isoformat()})
-    if todo:  # anything this run didn't refresh came from an earlier run: say so
+    if todo or a.podcast:  # anything this run didn't refresh came from an earlier run: say so
         for plat in PLATFORMS:
             f = os.path.join(a.out, f"posts_{plat}.json")
             if not (os.path.exists(f) and os.path.getmtime(f) < t0):
@@ -1780,7 +2311,26 @@ def scan(a):
                 note(f"{plat}: the follower count ({fmt(m.get('followers'))}) is from an earlier run, pulled "
                      f"{m.get('pulled', '?')};{flag} or use a new --out folder if it's another account's")
 
+    pj = os.path.join(a.out, "podcast.json")
+    if os.path.exists(pj) and os.path.getmtime(pj) < t0:
+        old = load(pj) or {}
+        what = f"podcast.json ({old.get('name') or '?'}, pulled {old.get('pulled', '?')})"
+        if a.podcast:  # this run's --podcast failed before saving (the note above says why)
+            note(f"podcast: this run's --podcast didn't replace it, so the earlier {what} goes into the report; "
+                 "use a new --out folder if that's another show")
+        else:
+            note(f"podcast: {what} is from an earlier run and goes into the report; pass --podcast to refresh it, "
+                 "or use a new --out folder if it's another show")
     posts, metas, _ = load_posts(a.out)
+    if not posts and os.path.exists(pj):  # a podcast-only scan
+        path = report(a.out, a.name or pod_info.get("name"), None, note=note)
+        print(f"\nscan finished in {time.time() - t0:.0f} s", file=sys.stderr)
+        if notes:
+            print("Notes:", file=sys.stderr)
+            for n in notes:
+                print(f"  - {n}", file=sys.stderr)
+        print(path)
+        return
     if not posts:
         for n in notes:
             print(f"  - {n}", file=sys.stderr)
@@ -1796,6 +2346,9 @@ def scan(a):
                              "update yt-dlp (`doctor` checks its age).")
             if "snapchat" in ran:
                 parts.append("Snapchat: check the network, and that the account is a Public Profile with Spotlights.")
+            if "podcast" in ran:
+                parts.append("Podcast: check the show name, or pass its Apple Podcasts ID (the digits after 'id' in "
+                             "its podcasts.apple.com link; the link works too).")
             if "instagram" in ran:
                 parts.append("Instagram: 401 means APIFY_TOKEN is wrong, 402 means the Apify account is out of credit; "
                              "otherwise check the username.")
@@ -1840,7 +2393,7 @@ def scan(a):
                     note("comments: yt-dlp isn't installed, so YouTube comments are "
                          + (f"the earlier ones ({kept} posts)" if kept else "left out"))
     prev = load(os.path.join(a.out, "summary.json"), {}) or {}
-    name = a.name or (handle_of(todo[0][1]) if todo else None) or prev.get("name")
+    name = a.name or (handle_of(todo[0][1]) if todo else None) or prev.get("name") or pod_info.get("name")
     path = report(a.out, name, None, note=note)
 
     print(f"\nscan finished in {time.time() - t0:.0f} s", file=sys.stderr)
@@ -1886,7 +2439,9 @@ def main():
     s.add_argument("--tiktok")
     s.add_argument("--instagram", help="needs APIFY_TOKEN in the environment; skipped with a note when it isn't set")
     s.add_argument("--snapchat", help="public profile, free and logged out; only the newest Spotlights the profile page lists")
-    s.add_argument("--name", help="report title (default: the first handle)")
+    s.add_argument("--podcast", help="show name, Apple Podcasts ID or podcasts.apple.com link: chart ranks, rating, reviews, "
+                   "episode cadence (free)")
+    s.add_argument("--name", help="report title (default: the first handle, or the show's name for a podcast-only scan)")
     s.add_argument("--tiktok-followers", type=int, help="override the TikTok follower count scan reads off the profile page")
     s.add_argument("--limit", type=int, default=60, help="posts per tab/profile (default 60; Instagram max 50)")
     s.add_argument("--yt-enrich", type=int, default=45,
@@ -1900,6 +2455,8 @@ def main():
     c.add_argument("--tiktok")
     c.add_argument("--instagram", help="needs APIFY_TOKEN in the environment; reels tab, about $0.11 per 40 reels, capped at $0.30 per Apify call (two calls)")
     c.add_argument("--snapchat", help="public profile, free and logged out; the newest Spotlights the profile page lists")
+    c.add_argument("--podcast", help="show name, Apple Podcasts ID or podcasts.apple.com link: chart ranks, rating, reviews, "
+                   "episode cadence (free)")
     c.add_argument("--limit", type=int, default=60, help="posts per tab/profile (default 60)")
     c.add_argument("--yt-enrich", type=int, default=45,
                    help="fetch likes/comments/exact dates for the newest N YouTube uploads (default 45, 0 = off)")
@@ -1941,12 +2498,13 @@ def main():
     if a.cmd == "scan":
         scan(a)
     elif a.cmd == "collect":
-        if not (a.youtube or a.tiktok or a.instagram or a.snapchat):
-            sys.exit("collect needs at least one of --youtube, --tiktok, --instagram, --snapchat")
+        if not (a.youtube or a.tiktok or a.instagram or a.snapchat or a.podcast):
+            sys.exit("collect needs at least one of --youtube, --tiktok, --instagram, --snapchat, --podcast")
         for flag, fn in ((a.youtube, lambda: collect_youtube(a.youtube, a.out, a.limit, a.yt_enrich)),
                          (a.tiktok, lambda: collect_tiktok(a.tiktok, a.out, a.limit)),
                          (a.instagram, lambda: collect_instagram(a.instagram, a.out, min(a.limit, 50))),
-                         (a.snapchat, lambda: collect_snapchat(a.snapchat, a.out))):
+                         (a.snapchat, lambda: collect_snapchat(a.snapchat, a.out)),
+                         (a.podcast, lambda: collect_podcast(a.podcast, a.out))):
             if not flag:
                 continue
             try:  # one platform failing shouldn't sink the others
