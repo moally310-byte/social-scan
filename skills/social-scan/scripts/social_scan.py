@@ -377,13 +377,25 @@ def group_stats(name, posts, meta=None):
     # cadence, median or tier counts
     window = [p for p in posts if not p.get("pinned")]
     dates = sorted(p["date"] for p in window if p.get("date"))
-    s = {"group": name, "posts": len(window), "with_views": sum(1 for p in window if p.get("views") is not None)}
+    # un-enriched YouTube uploads only say "3 months ago", so their dates bunch
+    # onto a few days and can be months late: cadence and the gap check use
+    # exact dates only (on 2026-10-15, 28 of 60 long-form landed on one day and
+    # made a false 59-day gap)
+    exact = sorted(p["date"] for p in window if p.get("date") and not p.get("date_approx"))
+    approx = sorted(p["date"] for p in window if p.get("date") and p.get("date_approx"))
+    s = {"group": name, "posts": len(window), "with_views": sum(1 for p in window if p.get("views") is not None),
+         "dates_approx": len(approx)}
     if dates:
+        # an approximate date is the latest the upload can be, so it decides
+        # the first date on a tie and the last date only when it's later
+        s.update(first=dates[0], last=dates[-1], first_approx=bool(approx) and (not exact or approx[0] <= exact[0]),
+                 last_approx=bool(approx) and (not exact or approx[-1] > exact[-1]))
+    if exact:
         # cadence runs to today, so a quiet stretch after the last post counts
-        span = (TODAY - dt.date.fromisoformat(dates[0])).days
-        s.update(first=dates[0], last=dates[-1],
-                 per_week=round(len(dates) / (span / 7), 1) if span >= 14 else "n/a")
-        s["gap"] = largest_gap(dates)
+        span = (TODAY - dt.date.fromisoformat(exact[0])).days
+        s.update(per_week=round(len(exact) / (span / 7), 1) if span >= 14 else "n/a",
+                 cadence_n=len(exact), cadence_from=exact[0])
+        s["gap"] = largest_gap(exact)
     # baseline excludes posts under 3 days old, which are still climbing
     in_window = [p for p in viewed if not p.get("pinned")] or viewed
     settled = [p for p in in_window if not is_fresh(p)]
@@ -779,8 +791,33 @@ def build_groups(all_posts, metas):
 
 
 def flags(p):
-    f = [x for x, on in (("pinned", p.get("pinned")), ("fresh", is_fresh(p))) if on]
+    f = [x for x, on in (("approx", p.get("date") and p.get("date_approx")), ("pinned", p.get("pinned")),
+                         ("fresh", is_fresh(p))) if on]
     return f" ({', '.join(f)})" if f else ""
+
+
+def per_week_txt(s):
+    pw = s.get("per_week", "n/a")
+    return f"{pw} ({s['cadence_n']} exact)" if s["dates_approx"] and s.get("cadence_n") and pw != "n/a" else pw
+
+
+def window_txt(s):
+    def one(key):
+        return f"{s[key]} (approx)" if s.get(f"{key}_approx") else s.get(key, "?")
+    return f"{one('first')} to {one('last')}"
+
+
+def approx_note(s):
+    """One line for a group whose window holds approximate dates, or None."""
+    n = s["dates_approx"]
+    if not n:
+        return None
+    line = (f"**Approximate dates:** {n} of {s['posts']} posts have only a \"3 months ago\"-style date from YouTube (marked approx), "
+            "so they bunch onto a few days and the real upload can be months earlier. ")
+    if s.get("cadence_n"):
+        return line + (f"Per week and the gap check use only the {s['cadence_n']} exact dates, from {s['cadence_from']} on; "
+                       "raise --yt-enrich to date more.")
+    return line + "No post here has an exact date, so per week and the gap check are left out; raise --yt-enrich to date them."
 
 
 def lift_txt(p):
@@ -822,11 +859,15 @@ def report(out, name, since, note=None):
         rn = f" ({s['rate_n']})" if s["like_rate"] is not None else ""
         t = s.get("tiers")
         tiers = f"{t['huge']} / {t['strong']} / {t['mild']}" if t else "n/a"
-        L.append(f"| {s['group']} | {s['posts']} | {s.get('per_week', 'n/a')} | {fmt(s.get('median'))} | "
+        L.append(f"| {s['group']} | {s['posts']} | {per_week_txt(s)} | {fmt(s.get('median'))} | "
                  f"{fmt(s.get('max'))} | {pct(s.get('top3_share'))} | {tiers} | {s['confidence']} ({s['baseline_n']}) | "
                  f"{pct(s['like_rate'])}{rn} | {pct(s['comment_rate'])} | {s.get('followers_per_1k') or 'n/a'} |")
     if undated_dropped:
         L.append(f"\n{undated_dropped} undated posts left out by --since (un-enriched YouTube Shorts).")
+    approx_kept = sum(1 for p in all_posts if p.get("date") and p.get("date_approx")) if since else 0
+    if approx_kept:
+        L.append(f"\n{approx_kept} posts kept by --since have approximate dates (un-enriched YouTube uploads), "
+                 f"so some may be older than {since}.")
     L.append("")
 
     for _, s in groups:
@@ -834,7 +875,7 @@ def report(out, name, since, note=None):
             continue
         t = s["tiers"]
         L += [f"## {s['group'].title()}",
-              f"{s.get('first', '?')} to {s.get('last', '?')}. Baseline: median {fmt(s.get('median'))} views "
+              f"{window_txt(s)}. Baseline: median {fmt(s.get('median'))} views "
               f"across {s['baseline_n']} posts, confidence {s['confidence']}. Outliers: {t['huge']} at 5x+, "
               f"{t['strong']} at 2-5x, {t['mild']} at 1.5-2x; {len(s['duds'])} under 0.2x."]
         if s["fresh"]:
@@ -842,6 +883,8 @@ def report(out, name, since, note=None):
         if s["pinned"]:
             L.append(f"{s['pinned']} pinned posts are listed for reference but sit outside the window: they stay out of "
                      "the dates, cadence, median and tier counts. Pinning keeps them in front of visitors, which explains part of their lift.")
+        if approx_note(s):
+            L.append(approx_note(s))
         g = s.get("gap")
         if g and g["flag"]:
             L.append(f"**Check the profile:** no posts for {g['days']} days between {g['from']} and {g['to']} "
@@ -888,7 +931,9 @@ def report(out, name, since, note=None):
           "- Top 3 share is the three biggest posts' share of all views. A high number means the account "
           "lives on a few hits, not a repeatable format.",
           "- Median views leave out posts under 3 days old. Like rate (n) shows how many posts had like counts.",
-          "- YouTube dates from flat listings are approximate unless enriched; Shorts without enrichment have no date.",
+          "- YouTube dates from flat listings are approximate unless enriched (date_approx in posts.csv and "
+          "summary.json, approx in the tables): YouTube only says \"3 months ago\", so the real upload can be months "
+          "earlier. Per week and the gap check use exact dates only. Shorts without enrichment have no date.",
           "- Posts under 3 days old are still climbing. Don't compare them with older posts.",
           "- Instagram comes from the reels tab, the only feed that returns the newest posts in order when logged out. "
           "Photos and carousels aren't sampled. Pinned posts are shown but kept out of every window figure "
@@ -898,7 +943,8 @@ def report(out, name, since, note=None):
     with open(os.path.join(out, "summary.md"), "w") as f:
         f.write("\n".join(L) + "\n")
     slim = [{k: v for k, v in s.items() if k not in ("top", "bottom", "outliers", "duds")} for _, s in groups]
-    lifts = [{k: p.get(k) for k in ("platform", "group", "id", "url", "date", "views", "lift", "tier", "eng_lift", "pinned")}
+    lifts = [{k: p.get(k) for k in ("platform", "group", "id", "url", "date", "date_approx", "views", "lift", "tier",
+                                    "eng_lift", "pinned")}
              for p in all_posts if p.get("lift") is not None]
     save(os.path.join(out, "summary.json"), {"pulled": TODAY.isoformat(), "name": name, "accounts": metas,
                                              "groups": slim, "posts": lifts})
