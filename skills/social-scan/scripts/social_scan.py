@@ -45,6 +45,7 @@ Tools come from PATH; YTDLP, FFMPEG, WHISPER_CLI and WHISPER_MODEL override them
 Everything is read-only. Never add --cookies or --cookies-from-browser.
 """
 import argparse
+import bisect
 import contextlib
 import csv
 import datetime as dt
@@ -2233,40 +2234,51 @@ def format_cuts(posts, zone):
     return rows, by, sample, {k: len(v) for k, v in placed.items()}, bases
 
 
-def chance_of(by_k, observed):
+def chance_of(by_k, named, observed):
     """How often random splits of the same posts give some row that isn't thin
-    a median lift of `observed` or more. Weekday and time rows are dealt whole
-    dates, each row keeping its count of dates (one boosted day lifts every
-    post on it, so a day's posts aren't independent); length rows are dealt
-    posts, each row keeping its size. A fixed seed, so a re-render reads the same."""
-    rows = list(by_k.values())
-    if len(rows) < 2:
+    a lead as unusual for its size as the named row's. Each shuffle scores every
+    row by how rarely a row of its size reaches the median it got (Westfall-
+    Young min-p), so a big row's clear lead isn't drowned by noisy 5-post rows.
+    Weekday rows are dealt whole dates, and time rows a date's posts within a
+    block, each row keeping its count of dates (a day's posts aren't
+    independent); length rows are dealt posts, each row keeping its size. A
+    fixed seed, so a re-render reads the same."""
+    keys = list(by_k)
+    if len(keys) < 2 or named not in by_k:
         return None
-    dated = any(q.get("_day") is not None for qs in rows for q in qs)
+    dated = any(q.get("_day") is not None for qs in by_k.values() for q in qs)
     blocks, counts = [], []
-    for qs in rows:
+    for k in keys:
         if dated:
             per = {}
-            for q in qs:
+            for q in by_k[k]:
                 per.setdefault(q.get("_day"), []).append(q["lift"])
             blocks += list(per.items())
             counts.append(len(per))
         else:
-            blocks += [(None, [q["lift"]]) for q in qs]
-            counts.append(len(qs))
-    rng, hits = random.Random(0), 0
+            blocks += [(None, [q["lift"]]) for q in by_k[k]]
+            counts.append(len(by_k[k]))
+    rng = random.Random(0)
+    meds = [[] for _ in keys]  # each row's median in each shuffle, None where it came out thin
     for _ in range(FORMAT_SHUFFLES):
         rng.shuffle(blocks)
-        at, best = 0, None
-        for c in counts:
+        at = 0
+        for j, c in enumerate(counts):
             part = blocks[at:at + c]
             at += c
             lifts = [x for _, ls in part for x in ls]
-            if len(lifts) < FORMAT_MIN_N or (dated and len({d for d, _ in part}) < FORMAT_MIN_DAYS):
-                continue  # a thin row can't be named, so it can't be the chance winner either
-            m = statistics.median(lifts)
-            best = m if best is None or m > best else best
-        hits += best is not None and best >= observed - 1e-9
+            ok = len(lifts) >= FORMAT_MIN_N and not (dated and len({d for d, _ in part}) < FORMAT_MIN_DAYS)
+            meds[j].append(statistics.median(lifts) if ok else None)  # a thin row can't be named, so can't win
+    ranked = [sorted(m for m in ms if m is not None) for ms in meds]
+
+    def p(j, x):  # how often row j, at its size, reaches a median of x or more
+        return (len(ranked[j]) - bisect.bisect_left(ranked[j], x - 1e-9)) / FORMAT_SHUFFLES
+
+    p_named = p(keys.index(named), observed)
+    hits = 0
+    for i in range(FORMAT_SHUFFLES):
+        ps = [p(j, meds[j][i]) for j in range(len(keys)) if meds[j][i] is not None]
+        hits += bool(ps) and min(ps) <= p_named + 1e-12
     return hits / FORMAT_SHUFFLES
 
 
@@ -2317,8 +2329,9 @@ def formats_section(groups, all_posts, tz=None):
           f"or more. Posts under 3 days old and pinned posts are left out. Rows under {FORMAT_MIN_N} posts, and weekday "
           f"and time rows from fewer than {FORMAT_MIN_DAYS} dates, are marked thin: read them as anecdotes. Weekday and "
           f"time use each post's exact upload time in {label}" + ("" if tz else " (this computer's zone; --tz changes it)")
-          + ". **Strongest** needs a 1.5x median lift and a lead that random splits of the same posts (whole days at a "
-          "time for weekday and time) give some row that isn't thin under 5% of the time. That bar is per table, so a "
+          + ". **Strongest** needs a 1.5x median lift and a lead that random splits of the same posts (a date's posts "
+          "move together for weekday and time) give some row that isn't thin, at its own size, under 5% of the time. "
+          "That bar is per table, so a "
           "group with three tables names a chance lead about one time in eight. These slice one account's own posts, "
           "so a row can still win for another reason "
           "(the topic, a trend, a collab, or the length the posts in that row happened to be): treat a strong row "
@@ -2387,14 +2400,15 @@ def formats_section(groups, all_posts, tz=None):
             r = strongest(rs)
             if not r:
                 continue
-            ch = chance_of(by[k], statistics.median(q["lift"] for q in by[k][r["bucket"]]))  # unrounded, as shuffled
+            ch = chance_of(by[k], r["bucket"], statistics.median(q["lift"] for q in by[k][r["bucket"]]))  # unrounded
             verdict[k] = {"bucket": r["bucket"], "median_lift": r["median_lift"], "chance": ch,
                           "finding": ch is not None and ch < 0.05}
             if verdict[k]["finding"]:
                 found.append(f"{k} {r['bucket']} ({r['median_lift']:.1f}x median lift, {r['n_2x']} of {r['n']} at 2x+)")
             else:
                 maybe.append(f"{k} {r['bucket']} leads at {r['median_lift']:.1f}x (n={r['n']}), but random splits of "
-                             f"these posts put some {some[k]} that high {round((ch or 0) * 100)}% of the time")
+                             f"these posts give some {some[k]} a lead that unusual for its size "
+                             f"{round((ch or 0) * 100)}% of the time")
         data["groups"][s["group"]] = {"posts": n, "timed": timed, "with_length": sized,
                                       "rebased_median_views": {"length": bases["length"] if rows["length"] else None,
                                                                "weekday_time": bases["weekday"] if rows["weekday"] else None},
@@ -2405,20 +2419,13 @@ def formats_section(groups, all_posts, tz=None):
             L.append("**Not a finding yet:** " + "; ".join(maybe) + ".")
         if shown and not found and not maybe:
             L.append("**Strongest:** no row that isn't thin reaches a 1.5x median lift, so nothing stands out yet.")
-        thin = sorted(((k, r) for k, rs in shown.items() for r in rs  # 3+ posts: a single post is just a post
-                       if r["thin"] and r["n"] >= 3 and r["median_lift"] >= 1.5),
-                      key=lambda t: -t[1]["median_lift"])[:3]
-        if thin:  # say why a strong-looking row above isn't named
-            L.append("**Thin leads** (anecdotes, not findings): " + "; ".join(
-                f"{k} {r['bucket']} at {r['median_lift']:.1f}x ({r['n']} post{'' if r['n'] == 1 else 's'}"
-                + (f" on {r['days']} day{'' if r['days'] == 1 else 's'}" if r.get("days") is not None else "") + ")"
-                for k, r in thin) + ".")
         lb = strongest(shown.get("length") or [])  # the caution runs on the leading length, chance or not
-        for k in ("weekday", "time"):  # a weekday or time can win on the length of the posts in it
-            v = verdict.get(k)
-            if not (lb and v and v["finding"]):
-                continue
-            r = next(x for x in shown[k] if x["bucket"] == v["bucket"])
+
+        def length_note(k, r):
+            """(same, inside, lift without them) when the leading length is over-represented in this row and the
+            row's lift falls by more than a quarter without those posts (or at all with under 5 left), else None."""
+            if not lb or k == "length":
+                return None
             inside = by[k][r["bucket"]]
             # the share of that length among this cut's own posts with a length, against its share in the row
             pool = [q for qs in by[k].values() for q in qs if cut_len(q)]
@@ -2427,17 +2434,47 @@ def formats_section(groups, all_posts, tz=None):
             rest = [q for q in inside if all(q is not x for x in same)]
             base = sum(1 for q in pool if cut_len(q) == lb["bucket"]) / len(pool) if pool else 1
             if not same or len(same) / len(known) <= base:
-                continue
+                return None
             if not rest:
-                L.append(f"**Check the length:** all {len(inside)} {r['bucket']} posts are {lb['bucket']}, the "
-                         "leading length, so this row says nothing about the day or time on its own.")
-                continue
+                return same, inside, None
             m = statistics.median(q["lift"] for q in rest)
             if m < 0.75 * r["median_lift"] or (len(rest) < FORMAT_MIN_N and m < r["median_lift"]):
+                return same, inside, m
+            return None
+
+        thin = sorted(((k, r) for k, rs in rows.items() if len(rs) >= 2 for r in rs  # 3+ posts: one post is just a post
+                       if r["thin"] and r["n"] >= 3 and r["median_lift"] >= 1.5), key=lambda t: -t[1]["median_lift"])[:3]
+        if thin:  # say why a strong-looking row isn't named, and what it leans on
+            bits = []
+            for k, r in thin:
+                t = (f"{k} {r['bucket']} at {r['median_lift']:.1f}x ({r['n']} post{'' if r['n'] == 1 else 's'}"
+                     + (f" on {r['days']} day{'' if r['days'] == 1 else 's'}" if r.get("days") is not None else ""))
+                note = length_note(k, r)
+                if note:
+                    same, inside, m = note
+                    t += (f"; all {lb['bucket']}" if m is None else
+                          f"; {len(same)} {'is' if len(same) == 1 else 'are'} {lb['bucket']}, {m:.2f}x without "
+                          f"{'it' if len(same) == 1 else 'them'}")
+                bits.append(t + ")")
+            L.append("**Thin leads** (anecdotes, not findings): " + "; ".join(bits) + ".")
+        for k in ("weekday", "time"):  # a weekday or time can win on the length of the posts in it
+            v = verdict.get(k)
+            if not (v and v["finding"]):
+                continue
+            r = next(x for x in shown[k] if x["bucket"] == v["bucket"])
+            note = length_note(k, r)
+            if not note:
+                continue
+            same, inside, m = note
+            if m is None:
+                L.append(f"**Check the length:** all {len(inside)} {r['bucket']} posts are {lb['bucket']}, the "
+                         "leading length, so this row says nothing about the day or time on its own.")
+            else:
+                rest_n = len(inside) - len(same)
                 L.append(f"**Check the length:** {len(same)} of the {len(inside)} {r['bucket']} posts "
                          f"{'is' if len(same) == 1 else 'are'} {lb['bucket']}, the leading length; without "
                          f"{'it' if len(same) == 1 else 'them'} its median lift is {m:.2f}x "
-                         f"(n={len(rest)}{', thin' if len(rest) < FORMAT_MIN_N else ''}).")
+                         f"(n={rest_n}{', thin' if rest_n < FORMAT_MIN_N else ''}).")
         L.append("")
     return L, data
 
