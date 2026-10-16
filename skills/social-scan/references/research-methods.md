@@ -12,7 +12,19 @@ Read this after `report` when writing the brief, and before comparing accounts.
 - Confidence: low under 10 baseline posts (source: "do not overstate confidence from fewer than 10 posts"). Medium 10-19, high 20+ (ours: the source only says "pull at least 20").
 - Lift is within one account's group. Never rank raw views across accounts of different sizes, and never pool platforms into one baseline.
 - Pinned posts get a lift boost from placement; fresh posts are still climbing. Both are marked in the table.
-- Per-post `lift` is in `posts.csv` and `summary.json` for any other cut.
+- Per-post `lift` is in `posts.csv` and `summary.json` for any other cut. TikTok groups show their median share and save rates on a line of their own.
+
+## What formats work (built into `report`)
+
+- Each video group (TikTok videos, YouTube Shorts, YouTube long-form, Instagram reels) is cut three ways: length bucket, weekday and 3-hour posting block. Each row: posts, median views, median lift, share at 2x+. Settled, unpinned posts only (ours).
+- Thin rows: under 5 posts, or for a weekday or time row, from fewer than 3 dates (one boosted day lifts every post on it). A thin row is never named strongest; thin rows of 3+ posts at 1.5x+, from any table of 2+ rows, are listed as **Thin leads**, anecdotes, each with the length note when the leading length explains it. A table of only thin rows, or of one row, becomes one line and isn't ranked; a group, or a kind of table, under 10 posts isn't cut (ours).
+- Posting times are exact or left out: TikTok, Instagram and Snapchat give one per post; YouTube's listing gives only a midnight guess, so only uploads looked up in the newest `--yt-enrich` run count. Times are shown in `--tz`, or this computer's zone.
+- Top-post lookups count as listed in every table: a Short's listing has no length, so a looked-up Short stays out of the length table, and no lookup enters the weekday or time tables. `top_lookup` in `posts.csv` and `summary.json` marks them; drop those rows before cutting either yourself.
+- A table that covers only some of the group (a YouTube Short's length and every YouTube posting time exist only for uploads looked up in the newest run; long-form lengths come from the listing) measures lift against those posts' own median views, so the newest run isn't scored against older posts that have had longer to collect views (ours).
+- **Strongest** needs a 1.5x median lift and a lead that random splits of the same posts give some row that isn't thin under 5% of the time, judged by how unusual each row's median is for its size (Westfall-Young min-p), so a big row's clear lead isn't drowned by noisy 5-post rows. 2,000 shuffles with a fixed seed: weekday rows are dealt whole dates and time rows a date's posts within one block (a day's posts aren't independent), and a date only trades places with dates that have as many posts, so every row keeps its count of dates and of posts; length rows are dealt single posts. A lead whose dates no other row can trade with reads "can't be tested against chance". In simulation with no real effect (1,500 groups each on seven posting schedules, with and without day-to-day swings), 4-7% of tables named a lead, and 9-15% of groups named one in any table; length assumes a post's length doesn't depend on its posting day (a creator who posts several clips of one length on the same strong days can see more). Otherwise the lead reads **Not a finding yet**, with that share. The bar is per table, so a group with three tables names a chance lead about one time in eight: a Strongest is a lead to test (ours).
+- **Check the length:** a weekday or time row can win on the length of the posts in it. When the leading length is over-represented in the strongest day or time (against that table's own posts with a length), and the row's median lift drops by more than a quarter without those posts (or falls at all when fewer than 5 are left), the report gives the lift without them. No line means one of three things: no length leads, the leading length isn't over-represented in the row, or the row's lift held within a quarter without it. It never means the row still beats every other row. In research, a creator's Saturday lead (6.1x) fell to 1.1x without its 3-10 minute clips; the same row came from only two dates, so it now reads thin.
+- Not cut: photo carousels (their listed length is the song's) and Snapchat (hidden view counts would tilt every row up; the Spotlight checks cover its length). Original vs named sound was tested and dropped: every named-sound post in the test sample was a carousel.
+- Correlation, not cause. In the brief, a strong row is a content test with its n quoted, not a schedule rule.
 
 ## Why it worked (the brief, written by Claude)
 
@@ -61,7 +73,7 @@ Scan the account into a new dated folder (`<project>/social-scan/<account>/<YYYY
 ## Repeatable patterns 2-4, each with evidence rows
 ## Hooks swipe file   verbatim, with channel + category + URL; top vs bottom contrast
 ## Comment themes     theme, bucket, frequency, intensity, exact quote
-## Content tests      3, each tied to an outlier or a comment theme
+## Content tests      3, each tied to an outlier, a comment theme or a format row (quote its n)
 ## Caveats            public data only, sample sizes, pinned/fresh, machine transcripts
 ```
 
