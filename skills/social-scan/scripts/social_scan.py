@@ -2197,11 +2197,13 @@ def cut_row(bucket, rows, days=None):
 
 def format_cuts(posts, zone):
     """One video group's settled posts cut by length, weekday and 3-hour
-    posting block. A cut that can place only some of the posts (lengths and
-    times exist only for looked-up YouTube uploads) is rebased on those posts'
-    own median views, so its rows compare like with like instead of carrying
-    the newest run's age against older posts. Returns (rows per cut, posts per
-    bucket, the sample, posts placed per cut, the rebased medians)."""
+    posting block. A cut that can place only some of the posts (a YouTube
+    Short's length and every YouTube posting time exist only for uploads looked
+    up in the newest run; long-form lengths come from the listing) is rebased on
+    those posts' own median views, so the newest run isn't scored against older
+    posts that have had longer to collect views. Returns (rows per cut, posts
+    per bucket as copies carrying their local date, the sample, posts placed per
+    cut, the rebased medians)."""
     sample = [p for p in posts if p.get("lift") is not None and p.get("views") is not None
               and not p.get("pinned") and not is_fresh(p)]
     placed = {"length": [], "weekday": [], "time": []}
@@ -2213,7 +2215,7 @@ def format_cuts(posts, zone):
         w = None if p.get("top_lookup") else posted_local(p, zone)
         if w:
             placed["weekday"].append((WEEKDAYS[w.weekday()], p, w.date()))
-            placed["time"].append((BLOCKS[w.hour // 3], p, None))
+            placed["time"].append((BLOCKS[w.hour // 3], p, w.date()))
     by, dates, bases = {}, {}, {}
     for k, items in placed.items():
         base = None
@@ -2222,33 +2224,49 @@ def format_cuts(posts, zone):
         bases[k] = base if base else None
         by[k], dates[k] = {}, {}
         for bucket, p, day in items:
-            q = dict(p, lift=round(p["views"] / base, 2)) if base else p
+            q = dict(p, lift=round(p["views"] / base, 2) if base else p["lift"], _day=day)
             by[k].setdefault(bucket, []).append(q)
             dates[k].setdefault(bucket, set()).add(day)
     order = {"length": [b[2] for b in LEN_BUCKETS], "weekday": WEEKDAYS, "time": BLOCKS}
-    rows = {k: [cut_row(b, by[k][b], len(dates[k][b]) if k == "weekday" else None) for b in order[k] if b in by[k]]
+    rows = {k: [cut_row(b, by[k][b], len(dates[k][b]) if k != "length" else None) for b in order[k] if b in by[k]]
             for k in by}
     return rows, by, sample, {k: len(v) for k, v in placed.items()}, bases
 
 
 def chance_of(by_k, observed):
-    """How often random splits of the same posts, each row keeping its size,
-    give some row of FORMAT_MIN_N+ posts a median lift of `observed` or more.
-    A fixed seed, so a re-render reads the same."""
-    sizes = [len(v) for v in by_k.values()]
-    lifts = [p["lift"] for v in by_k.values() for p in v]
-    if sum(1 for n in sizes if n >= FORMAT_MIN_N) < 1 or len(sizes) < 2:
+    """How often random splits of the same posts give some row that isn't thin
+    a median lift of `observed` or more. Weekday and time rows are dealt whole
+    dates, each row keeping its count of dates (one boosted day lifts every
+    post on it, so a day's posts aren't independent); length rows are dealt
+    posts, each row keeping its size. A fixed seed, so a re-render reads the same."""
+    rows = list(by_k.values())
+    if len(rows) < 2:
         return None
+    dated = any(q.get("_day") is not None for qs in rows for q in qs)
+    blocks, counts = [], []
+    for qs in rows:
+        if dated:
+            per = {}
+            for q in qs:
+                per.setdefault(q.get("_day"), []).append(q["lift"])
+            blocks += list(per.items())
+            counts.append(len(per))
+        else:
+            blocks += [(None, [q["lift"]]) for q in qs]
+            counts.append(len(qs))
     rng, hits = random.Random(0), 0
     for _ in range(FORMAT_SHUFFLES):
-        rng.shuffle(lifts)
+        rng.shuffle(blocks)
         at, best = 0, None
-        for n in sizes:
-            if n >= FORMAT_MIN_N:
-                m = statistics.median(lifts[at:at + n])
-                best = m if best is None or m > best else best
-            at += n
-        hits += best >= observed - 1e-9
+        for c in counts:
+            part = blocks[at:at + c]
+            at += c
+            lifts = [x for _, ls in part for x in ls]
+            if len(lifts) < FORMAT_MIN_N or (dated and len({d for d, _ in part}) < FORMAT_MIN_DAYS):
+                continue  # a thin row can't be named, so it can't be the chance winner either
+            m = statistics.median(lifts)
+            best = m if best is None or m > best else best
+        hits += best is not None and best >= observed - 1e-9
     return hits / FORMAT_SHUFFLES
 
 
@@ -2297,10 +2315,12 @@ def formats_section(groups, all_posts, tz=None):
           f"Each row is a slice of one group's own posts: posts, median views, median lift (views over the group's "
           f"median, or over the median of the posts a table covers when that's only some of them) and the share at 2x "
           f"or more. Posts under 3 days old and pinned posts are left out. Rows under {FORMAT_MIN_N} posts, and weekday "
-          f"rows from fewer than {FORMAT_MIN_DAYS} dates, are marked thin: read them as anecdotes. Weekday and time "
-          f"use each post's exact upload time in {label}" + ("" if tz else " (this computer's zone; --tz changes it)")
-          + ". **Strongest** needs a 1.5x median lift and a lead that random splits of the same posts rarely give "
-          "(under 5% of the time). These slice one account's own posts, so a row can still win for another reason "
+          f"and time rows from fewer than {FORMAT_MIN_DAYS} dates, are marked thin: read them as anecdotes. Weekday and "
+          f"time use each post's exact upload time in {label}" + ("" if tz else " (this computer's zone; --tz changes it)")
+          + ". **Strongest** needs a 1.5x median lift and a lead that random splits of the same posts (whole days at a "
+          "time for weekday and time) give some row that isn't thin under 5% of the time. That bar is per table, so a "
+          "group with three tables names a chance lead about one time in eight. These slice one account's own posts, "
+          "so a row can still win for another reason "
           "(the topic, a trend, a collab, or the length the posts in that row happened to be): treat a strong row "
           "as something to test, not a rule."]
     if any(s["group"] in ("tiktok photos", "instagram photos/carousels") for _, s in groups):
@@ -2327,20 +2347,22 @@ def formats_section(groups, all_posts, tz=None):
         why_len, why_time = missing_why(sample, zone)
         lead = f"{n} settled posts."
         if sized < n:
-            lead += (f" {n - sized} {'has' if n - sized == 1 else 'have'} no length ({why_len})"
-                     + (f", which leaves {sized}: too few for the length table." if 0 < sized < FORMAT_MIN_SAMPLE else
-                        ", so there's no length table." if not sized else "."))
+            lead += (f" {n - sized} {'is' if n - sized == 1 else 'are'} left out of the length table ({why_len})"
+                     + (f", which leaves {sized}: too few for it." if 0 < sized < FORMAT_MIN_SAMPLE else
+                        ", so there's none." if not sized else "."))
         if timed < n:
             lead += (f" {n - timed} {'is' if n - timed == 1 else 'are'} left out of the weekday and time tables "
                      f"({why_time})" + (", so there are none." if not timed else
                                         f", which leaves {timed}: too few for them." if timed < FORMAT_MIN_SAMPLE else "."))
-        rebased = [(k, bases[k]) for k in ("length", "weekday") if bases[k] and rows[k]]
+        compared = {k: len(rows[k]) >= 2 and not all(r["thin"] for r in rows[k]) for k in rows}  # shown as a table
+        compared["weekday"] = compared["weekday"] or compared["time"]  # one base serves both
+        rebased = [(k, bases[k]) for k in ("length", "weekday") if bases[k] and compared[k]]
         names = {"length": "length", "weekday": "weekday and time"}
         rebased = ([f"length, weekday and time: {fmt(rebased[0][1])}"] if len(rebased) == 2 and rebased[0][1] == rebased[1][1]
                    else [f"{names[k]}: {fmt(v)}" for k, v in rebased])
         if rebased:
             lead += (" Tables that cover only some of these posts measure lift against those posts' own median views ("
-                     + "; ".join(rebased) + "), so their rows compare like with like.")
+                     + "; ".join(rebased) + "), not against posts they leave out, which have had longer to collect views.")
         L += [lead, ""]
         shown = {}
         for k in ("length", "weekday", "time"):
@@ -2365,7 +2387,7 @@ def formats_section(groups, all_posts, tz=None):
             r = strongest(rs)
             if not r:
                 continue
-            ch = chance_of(by[k], r["median_lift"])
+            ch = chance_of(by[k], statistics.median(q["lift"] for q in by[k][r["bucket"]]))  # unrounded, as shuffled
             verdict[k] = {"bucket": r["bucket"], "median_lift": r["median_lift"], "chance": ch,
                           "finding": ch is not None and ch < 0.05}
             if verdict[k]["finding"]:
@@ -2374,14 +2396,23 @@ def formats_section(groups, all_posts, tz=None):
                 maybe.append(f"{k} {r['bucket']} leads at {r['median_lift']:.1f}x (n={r['n']}), but random splits of "
                              f"these posts put some {some[k]} that high {round((ch or 0) * 100)}% of the time")
         data["groups"][s["group"]] = {"posts": n, "timed": timed, "with_length": sized,
-                                      "rebased_median_views": {"length": bases["length"], "weekday_time": bases["weekday"]},
+                                      "rebased_median_views": {"length": bases["length"] if rows["length"] else None,
+                                                               "weekday_time": bases["weekday"] if rows["weekday"] else None},
                                       "strongest": verdict, **rows}
         if found:
             L.append("**Strongest:** " + "; ".join(found) + ".")
         if maybe:
             L.append("**Not a finding yet:** " + "; ".join(maybe) + ".")
-        if not found and not maybe:
-            L.append(f"**Strongest:** no row of {FORMAT_MIN_N}+ posts reaches a 1.5x median lift, so nothing stands out yet.")
+        if shown and not found and not maybe:
+            L.append("**Strongest:** no row that isn't thin reaches a 1.5x median lift, so nothing stands out yet.")
+        thin = sorted(((k, r) for k, rs in shown.items() for r in rs  # 3+ posts: a single post is just a post
+                       if r["thin"] and r["n"] >= 3 and r["median_lift"] >= 1.5),
+                      key=lambda t: -t[1]["median_lift"])[:3]
+        if thin:  # say why a strong-looking row above isn't named
+            L.append("**Thin leads** (anecdotes, not findings): " + "; ".join(
+                f"{k} {r['bucket']} at {r['median_lift']:.1f}x ({r['n']} post{'' if r['n'] == 1 else 's'}"
+                + (f" on {r['days']} day{'' if r['days'] == 1 else 's'}" if r.get("days") is not None else "") + ")"
+                for k, r in thin) + ".")
         lb = strongest(shown.get("length") or [])  # the caution runs on the leading length, chance or not
         for k in ("weekday", "time"):  # a weekday or time can win on the length of the posts in it
             v = verdict.get(k)
@@ -3131,7 +3162,7 @@ def build_report(out, name, since, note, prior, tz=None):
     with open(os.path.join(out, "posts.csv"), "w", newline="") as f:
         cols = ["platform", "group", "kind", "date", "date_approx", "posted_at", "views", "lift", "tier", "eng_lift",
                 "likes", "comments", "shares", "saves", "duration_s", "pinned", "caption", "url", "id",
-                "views_hidden", "slides", "recommends", "kind_checked", "top_lookup", "listed_date"]
+                "views_hidden", "slides", "recommends", "kind_checked", "top_lookup", "listed_date", "listed_date_approx"]
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for p in sorted(all_posts, key=lambda p: (p["platform"], p.get("date") or ""), reverse=True):
@@ -3331,7 +3362,8 @@ def finish_report(out, name, L, groups, all_posts, metas, prior=None, since=None
         f.write("\n".join(L) + "\n")
     slim = [{k: v for k, v in s.items() if k not in ("top", "bottom", "outliers", "duds")} for _, s in groups]
     lifts = [{k: p.get(k) for k in ("platform", "group", "id", "url", "date", "date_approx", "views", "views_hidden",
-                                    "likes", "lift", "tier", "eng_lift", "pinned")}
+                                    "likes", "lift", "tier", "eng_lift", "pinned", "top_lookup", "listed_date",
+                                    "listed_date_approx")}
              for p in all_posts]  # every post, so the next scan's "Since last scan" knows what this one saw
     pod = load(os.path.join(out, "podcast.json"))
     day, at = collected_on(out, metas, pod or {})
