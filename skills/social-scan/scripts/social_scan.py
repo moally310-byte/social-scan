@@ -15,12 +15,14 @@ Backends
 Start here
   doctor     [--get-model]   what's installed, what each missing piece turns off,
                              and the install line for macOS and Linux
-  scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--name N]
-             [--tiktok-followers N] [--limit N] [--yt-enrich N] [--no-hooks] [--no-comments]
+  scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--name N] [--prev DIR]
+             [--tiktok-followers N] [--limit N] [--yt-enrich N] [--no-hooks] [--no-comments] [--no-prev]
                              collect, hooks, comments and report in one go;
                              a step whose tool is missing is skipped with a note.
-                             Use one --out folder per account: scan reports
-                             everything already in it.
+                             Use one dated --out folder per account and run
+                             (<account>/<YYYY-MM-DD>/): scan reports everything
+                             already in it, and compares it with the newest
+                             earlier dated folder beside it.
 
 Single steps
   collect    --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--limit N] [--yt-enrich N]
@@ -28,7 +30,8 @@ Single steps
   meta       --out DIR --platform P --followers N [--following N] [--source TEXT]
   hooks      --out DIR [--top N] [--bottom N] [--seconds S]
   comments   --out DIR [--top N] [--max N]
-  report     --out DIR [--name NAME] [--since YYYY-MM-DD]
+  report     --out DIR [--name NAME] [--since YYYY-MM-DD] [--prev DIR | --no-prev]
+  diff       OLD NEW         what changed between two scan folders of one account
 
 Outlier lift tiers and the hooks pass are adapted from ScrapeCreators'
 social-media-research-skills @ 64ba7b4 (MIT): outlier-post-finder and
@@ -38,6 +41,7 @@ Tools come from PATH; YTDLP, FFMPEG, WHISPER_CLI and WHISPER_MODEL override them
 Everything is read-only. Never add --cookies or --cookies-from-browser.
 """
 import argparse
+import contextlib
 import csv
 import datetime as dt
 import json
@@ -57,6 +61,8 @@ FFMPEG = os.path.expanduser(os.environ.get("FFMPEG") or "ffmpeg")
 WHISPER = os.path.expanduser(os.environ.get("WHISPER_CLI") or "whisper-cli")
 WHISPER_MODEL = os.path.expanduser(os.environ.get("WHISPER_MODEL") or "~/.local/share/whisper-cpp/ggml-base.en.bin")
 TODAY = dt.date.today()
+PULLED_AT = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+RUN_DAY = TODAY  # the real date of this run; TODAY moves to a folder's collect day while its report is built
 
 MIN_PY = (3, 8)
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
@@ -200,6 +206,15 @@ def num(v):
         return None
 
 
+def stamp(out, what):
+    """Record when this folder's `what` data was collected. A report written
+    later keeps that date, so a re-render can't pass for a fresh scan."""
+    path = os.path.join(out, "collected.json")
+    d = load(path) or {}
+    d[what] = PULLED_AT
+    save(path, d)
+
+
 def save(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -278,6 +293,7 @@ def collect_youtube(handle, out, limit, enrich):
         print(f"  youtube: enriched {len(targets)} of {len(posts)}", file=sys.stderr)
 
     save(os.path.join(out, "posts_youtube.json"), posts)
+    stamp(out, "youtube")
     if followers is not None:
         save(os.path.join(out, "meta_youtube.json"),
              {"followers": followers, "following": None, "source": "yt-dlp channel_follower_count",
@@ -368,6 +384,7 @@ def collect_tiktok(handle, out, limit, quiet_followers=False):
         q["kind_checked"] = k is not None
     info["unchecked"] = unchecked = sum(1 for k in kinds if k is None)
     save(os.path.join(out, "posts_tiktok.json"), posts)
+    stamp(out, "tiktok")
     if prof and prof["followers"] is not None:
         save(os.path.join(out, "meta_tiktok.json"), {"followers": prof["followers"], "following": prof["following"],
                                                      "source": "tiktok.com profile page, logged out",
@@ -747,6 +764,7 @@ def collect_podcast(query, out):
                        "newest": max((r["date"] for r in reviews if r["date"]), default=None), "stars": stars},
            "errors": errors}
     save(os.path.join(out, "podcast.json"), pod)
+    stamp(out, "podcast")
     save(os.path.join(out, "reviews_apple.json"), reviews)
     ranked = [f"{c['source']} {c['chart']} #{c['rank']}" for c in charts if c["rank"]]
     print(f"  podcast: {pod['name']} ({matched}); " + (", ".join(ranked) if ranked else "not in any chart checked")
@@ -777,7 +795,7 @@ def podcast_section(out):
     if rc and sum(rc.values()) > 1:  # with one rating the header already says it
         n = sum(rc.values())
         L.append(f"All {n:,} US Apple ratings: " + " · ".join(f"{k}★ {rc.get(k, 0) / n:.0%}" for k in ("5", "4", "3", "2", "1")) + ".")
-    if pulled and pulled != TODAY:
+    if pulled and pulled != RUN_DAY:
         L.append(f"These podcast numbers are from {pulled}; run scan with --podcast again to refresh them.")
     also = pod.get("also_named") or []
     if also:
@@ -802,7 +820,7 @@ def podcast_section(out):
         except (KeyError, TypeError, ValueError):
             newest = None
         if newest and pulled:
-            days, later = (pulled - newest).days, pulled != TODAY
+            days, later = (pulled - newest).days, pulled != RUN_DAY
             if days < 0:  # the feed allows items up to a day ahead
                 ago = f" (dated after the {pulled} pull)" if later else " (dated ahead of today)"
             elif days == 0:
@@ -944,6 +962,8 @@ def collect_snapchat(handle, out):
     raw = {k: v for k, v in pp.items() if "comment" not in k.lower()}  # the receipt, minus commenter identities
     save(os.path.join(out, "raw", "snapchat_profile.json"), raw)
     save(os.path.join(out, "posts_snapchat.json"), posts)
+    stamp(out, "snapchat")
+    merge_snapchat_history(out, posts)
     if inline:
         save(os.path.join(out, "comments_snapchat_inline.json"), inline)
     save(os.path.join(out, "meta_snapchat.json"), {
@@ -1049,6 +1069,7 @@ def ingest_ig(posts_path, profile_path, out, feed="reels"):
     if not posts:
         print("  instagram: 0 posts (private, empty, or blocked)", file=sys.stderr)
     save(os.path.join(out, "posts_instagram.json"), posts)
+    stamp(out, "instagram")
     print(f"  instagram: {len(posts)} posts ingested", file=sys.stderr)
     if profile_path:
         prof = load(profile_path, [])
@@ -1803,7 +1824,404 @@ def spotlight_checks(posts, meta):
     return L
 
 
-def report(out, name, since, note=None):
+# ---------- run history ----------
+
+# a scan folder is named for its date, with an optional short run marker:
+# 2026-10-16, 2026-10-16-2, 2026-10-16b. Anything longer ("2026-10-16-duolingo")
+# is another layout, where siblings can be other accounts.
+DATED_DIR = re.compile(r"\d{4}-\d{2}-\d{2}(?:[-_.]?(?:\d{1,2}|[a-z]))?$")
+SNAP_HISTORY = "posts_snapchat_history.json"
+
+
+def run_key(name):
+    """Sort key for a dated folder: its date, then its run marker as a number
+    or a letter, so 2026-10-16-10 comes after 2026-10-16-9."""
+    m = re.match(r"(\d{4}-\d{2}-\d{2})[-_.]?(.*)$", name)
+    t = m.group(2) if m else ""
+    return (m.group(1) if m else name, (1, int(t), "") if t.isdigit() else (2, 0, t) if t else (0, 0, ""))
+
+
+def older_scans(out, need=("summary.json",)):
+    """Earlier dated siblings of a dated --out folder (the documented
+    <account>/<YYYY-MM-DD>/ layout) holding one of `need`, newest first."""
+    here = os.path.abspath(out)
+    name = os.path.basename(here)
+    if not DATED_DIR.match(name):
+        return []
+    parent = os.path.dirname(here)
+    try:
+        sibs = os.listdir(parent)
+    except OSError:
+        return []
+    older = sorted((s for s in sibs if DATED_DIR.match(s) and run_key(s) < run_key(name)
+                    and any(os.path.isfile(os.path.join(parent, s, f)) for f in need)), key=run_key, reverse=True)
+    return [os.path.join(parent, s) for s in older]
+
+
+def prior_scan(out, need=("summary.json",)):
+    """The newest earlier dated sibling holding one of `need`; None otherwise."""
+    older = older_scans(out, need)
+    return older[0] if older else None
+
+
+def later_than(a, b):
+    """True when collect time a is after b (both ISO strings; dates compare as days)."""
+    try:
+        if len(a) > 10 and len(b) > 10:
+            return dt.datetime.fromisoformat(a) > dt.datetime.fromisoformat(b)
+    except (TypeError, ValueError):
+        pass
+    return str(a)[:10] > str(b)[:10]
+
+
+def group_of(p):
+    """The report group a post falls in, for posts an earlier summary.json doesn't list."""
+    k, plat = p.get("kind"), p.get("platform")
+    return {"youtube": "youtube shorts" if k == "short" else "youtube long-form",
+            "instagram": "instagram reels" if k == "reel" else "instagram photos/carousels",
+            "tiktok": "tiktok photos" if k == "photo" else "tiktok videos",
+            "snapchat": "snapchat spotlight"}.get(plat, plat)
+
+
+@contextlib.contextmanager
+def as_of(day):
+    """Measure freshness and cadence to `day` (a folder's collect day) instead of
+    the date this runs, and put the real date back afterwards."""
+    global TODAY
+    saved = TODAY
+    try:
+        TODAY = dt.date.fromisoformat(str(day)[:10]) if day else saved
+    except ValueError:
+        pass
+    try:
+        yield
+    finally:
+        TODAY = saved
+
+
+def collected_on(folder, metas=None, pod=None):
+    """(date, timestamp) a folder's data was collected, not when its report was
+    last written: the collect stamps, else the follower records and the podcast
+    pull, else a report from before the stamps (which re-renders restamped)."""
+    stamps = [v for v in (load(os.path.join(folder, "collected.json")) or {}).values() if isinstance(v, str) and v]
+    if stamps:
+        return max(stamps)[:10], max(stamps)
+    if metas is None:
+        metas = load_posts(folder)[1]
+    pod = pod if pod is not None else load(os.path.join(folder, "podcast.json")) or {}
+    days = [str(x)[:10] for x in [m.get("pulled") for m in metas.values()] + [pod.get("pulled")] if x]
+    if days:
+        return max(days), None
+    so = load(os.path.join(folder, "summary.json")) or {}
+    return so.get("pulled"), so.get("pulled_at")
+
+
+def scan_state(folder):
+    """A scan folder as its report read on the day it was collected: rebuilt
+    from its own posts files, with freshness and cadence measured to that day,
+    so a later re-render of that folder (a --since window, a restamped date)
+    can't change what "then" means."""
+    so = load(os.path.join(folder, "summary.json")) or {}
+    raw, metas, _ = load_posts(folder)
+    pod = load(os.path.join(folder, "podcast.json")) or so.get("podcast")
+    day, at = collected_on(folder, metas, pod or {})
+    posts = [dict(p) for p in raw]
+    with as_of(day):
+        groups = [g for _, g in build_groups(posts, metas)]
+    return {"pulled": day, "pulled_at": at, "name": so.get("name"), "accounts": metas, "groups": groups,
+            "posts": posts, "podcast": pod}
+
+
+def step(p):
+    """The rounding step of a shown view count (0 when exact): TikTok shows 1M+
+    in 100K steps and 10K+ in 100s; YouTube counts outside --yt-enrich (no
+    likes) are rounded to about two figures."""
+    v = p.get("views")
+    if not v:
+        return 0
+    if p.get("platform") == "tiktok":
+        return 100_000 if v >= 1_000_000 and v % 100_000 == 0 else 100 if v >= 10_000 and v % 100 == 0 else 0
+    if p.get("platform") == "youtube" and p.get("likes") is None and v >= 1000:
+        return 10 ** (len(str(int(v))) - 2)
+    return 0
+
+
+def since_last(prior, now, name, out):
+    """The "Since last scan" section: what changed between an earlier scan of
+    the account and this one. Raises ValueError when `prior` isn't earlier."""
+    then = scan_state(prior)
+    if not then["pulled"] and not then["posts"] and not then.get("podcast"):
+        return []
+    try:
+        days = (dt.date.fromisoformat(now["pulled"]) - dt.date.fromisoformat(then["pulled"])).days
+    except (TypeError, ValueError):
+        days = None
+    if days is not None and (days < 0 or (days == 0 and then.get("pulled_at") and now.get("pulled_at")
+                                         and later_than(then["pulled_at"], now["pulled_at"]))):
+        raise ValueError(f"{os.path.basename(os.path.abspath(prior))} was collected after this folder "
+                         f"({then['pulled']}, this one {now['pulled']}), so it isn't an earlier scan")
+    rel = os.path.relpath(os.path.join(prior, "summary.md"), out).replace(os.sep, "/")
+    L = ["## Since last scan",
+         f"Compared with [{os.path.basename(os.path.abspath(prior))}]({f'<{rel}>' if ' ' in rel else rel})"
+         + (f", pulled {then['pulled']}" + (f" at {then['pulled_at'][11:16]}" if days == 0 and then.get("pulled_at") else "")
+            + (" (earlier the same day)" if days == 0 else f" ({days} day{'' if days == 1 else 's'} earlier)")
+            if days is not None else "") + "."]
+    if then.get("name") and name and norm_name(then["name"]) != norm_name(name):
+        L.append(f"The earlier report is titled \"{then['name']}\": check it's the same account.")
+
+    rows = []
+    for plat in PLATFORMS:
+        a = ((then["accounts"] or {}).get(plat) or {}).get("followers")
+        b = ((now["accounts"] or {}).get(plat) or {}).get("followers")
+        if a is None and b is None:
+            continue
+        ch = f"{b - a:+,} ({(b - a) / a * 100:+.1f}%)" if a and b is not None else "n/a"
+        rows.append((plat, f"| {plat} | {fmt(a)} | {fmt(b)} | {ch} |"))
+    if rows:
+        L += ["", "| Platform | Followers then | Followers now | Change |", "|---|---|---|---|"] + [r for _, r in rows]
+        if any(plat in ("youtube", "snapchat") for plat, _ in rows):
+            L += ["", "YouTube and Snapchat show rounded follower counts, so a change there can read as 0 or as a "
+                      "whole rounding step."]
+
+    pt, pn = then.get("podcast") or {}, now.get("podcast") or {}
+    if pt and pn and str(pt.get("apple_id")) == str(pn.get("apple_id")):
+        bits = []
+        if pt.get("ratings") is not None and pn.get("ratings") is not None:
+            bits.append(f"US ratings {pt['ratings']:,} → {pn['ratings']:,} ({pn['ratings'] - pt['ratings']:+,})"
+                        + (f", rated {pt['rating']} → {pn['rating']}" if pt.get("rating") and pn.get("rating") else ""))
+        ft, fn = pt.get("feed") or {}, pn.get("feed") or {}
+        if ft.get("per_week") is not None and fn.get("per_week") is not None:
+            bits.append(f"episodes a week {ft['per_week']} → {fn['per_week']}")
+        old_c = {(c.get("source"), c.get("chart")): c for c in pt.get("charts") or [] if isinstance(c, dict)}
+        rank = lambda c: ("n/a" if not c else f"#{c['rank']}" if c.get("rank") else
+                          f"not in the top {c['size']}" if c.get("size") else "couldn't read")
+        crow = [f"| {c.get('source')} {c.get('chart')} | {rank(old_c.get((c.get('source'), c.get('chart'))))} | {rank(c)} |"
+                for c in pn.get("charts") or [] if isinstance(c, dict)]
+        L += ["", f"**Podcast** ({pn.get('name')}): " + ("; ".join(bits) if bits else "no comparable totals") + "."]
+        if crow:
+            L += ["", "| Chart | Then | Now |", "|---|---|---|"] + crow
+
+    def med(s):
+        if not s:
+            return "n/a"
+        return f"under {fmt(s['median_under'])}" if s.get("median_under") is not None else fmt(s.get("median"))
+
+    def x2(s):
+        t = s.get("tiers") if s else None
+        return (t.get("huge", 0) + t.get("strong", 0)) if isinstance(t, dict) else "n/a"
+
+    def t3(s):
+        if not s:
+            return "n/a"
+        return ("≤" if s.get("top3_upper") and s.get("top3_share") is not None else "") + pct(s.get("top3_share"))
+
+    def span(s):  # days the group's posts cover, both ends counted
+        try:
+            return (dt.date.fromisoformat(s["last"]) - dt.date.fromisoformat(s["first"])).days + 1
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    tg = {g.get("group"): g for g in then["groups"]}
+    ng = [g for g in now["groups"] if isinstance(g, dict)]
+    if ng:
+        L += ["", "| Group | Posts then | now | Median then | now | Per week then | now | 2x+ then | now | Top 3 share then | now |",
+              "|---|---|---|---|---|---|---|---|---|---|---|"]
+        uneven = []
+        for g in ng:
+            o = tg.get(g["group"], {})
+            L.append(f"| {g['group']} | {o.get('posts', 'n/a')} | {g.get('posts')} | {med(o)} | {med(g)} | "
+                     f"{o.get('per_week', 'n/a') if o else 'n/a'} | {g.get('per_week', 'n/a')} | {x2(o)} | {x2(g)} | "
+                     f"{t3(o)} | {t3(g)} |")
+            a, b = span(o) if o else None, span(g)
+            if a and b and max(a, b) / min(a, b) > 1.5:
+                dd = lambda n: f"{n} day{'' if n == 1 else 's'}"
+                uneven.append((g["group"], f"{g['group']} covered {dd(a)} with {o.get('posts')} posts then, "
+                                           f"{dd(b)} with {g.get('posts')} now"))
+        if uneven:
+            snap = any(k.startswith("snapchat") for k, _ in uneven)
+            other = any(not k.startswith("snapchat") for k, _ in uneven)
+            L += ["", "**Different windows:** " + "; ".join(t for _, t in uneven) + ". A window more than 1.5 times "
+                  "longer in one scan means part of these changes is the window, not the content: quote those rows "
+                  "with that caveat" + (", or scan again with a --limit that covers a similar range" if other else "")
+                  + (". Snapchat lists only its newest Spotlights logged out, so compare Snapchat scans taken at a "
+                     "similar interval" if snap else "") + "."]
+        dropped = [k for k in tg if k not in {g["group"] for g in ng}]
+        if dropped:
+            L += ["", f"In the earlier scan only: {', '.join(dropped)}."]
+
+    # posts are compared only for platforms collected in both scans
+    plats_then = {p.get("platform") for p in then["posts"]}
+    plats_now = {p.get("platform") for p in now["posts"]}
+    shared = plats_then & plats_now
+    one_sided = [f"{plat} (in the earlier scan only: {sum(1 for p in then['posts'] if p.get('platform') == plat)} "
+                 "posts, not collected this run)" for plat in sorted(plats_then - plats_now)]
+    one_sided += [f"{plat} (new in this scan)" for plat in sorted(plats_now - plats_then)]
+    if one_sided:
+        L += ["", "**Not compared:** " + "; ".join(one_sided) + "."]
+    key = lambda p: (p.get("platform"), p.get("id"))
+    old = {key(p): p for p in then["posts"] if p.get("platform") in shared}
+    cur = {key(p): p for p in now["posts"] if p.get("platform") in shared}
+    if old or cur:
+        new = [p for k, p in cur.items() if k not in old]
+        both = [(old[k], p) for k, p in cur.items() if k in old]
+        gone = [p for k, p in old.items() if k not in cur]
+        fresh = [p for p in new if p.get("date") and then["pulled"] and p["date"] >= then["pulled"]]
+        undated = [p for p in new if not p.get("date")]
+        back = len(new) - len(fresh) - len(undated)
+        L += ["", f"**Posts:** {len(fresh)} posted since the last scan"
+              + (f", {back} older post{'s' if back != 1 else ''} newly in the sample" if back else "")
+              + (f", {len(undated)} new to the sample with no date (YouTube Shorts past --yt-enrich)" if undated else "")
+              + f", {len(both)} in both, {len(gone)} only in the earlier scan (aged out of the sample, or deleted: "
+              "check before saying deleted)."]
+        if fresh:
+            top = sorted(fresh, key=lambda p: (p.get("views") if p.get("views") is not None else -1, p.get("likes") or 0),
+                         reverse=True)[:10]
+            L += ["", "**New posts**" + (f" (top 10 of {len(fresh)})" if len(fresh) > 10 else ""),
+                  "| Group | Posted | Views | Lift | Opening line |", "|---|---|---|---|---|"]
+            for p in top:
+                v = f"[{fmt(p.get('views'))}]({p['url']})" if p.get("url") else fmt(p.get("views"))
+                L.append(f"| {p.get('group') or group_of(p)} | {p.get('date') or '?'}{flags(p)} | {v} | {lift_txt(p)} | "
+                         f"{cell(p.get('caption')) or '_(no caption)_'} |")
+        grew = sorted(((max(step(a), step(b)), b["views"] - a["views"], a, b) for a, b in both
+                       if a.get("views") is not None and b.get("views") is not None and b["views"] > a["views"]),
+                      key=lambda t: -(t[1] - t[0]))  # ranked by what the gain is at least, so a rounding step can't lead
+        grew = [(st and 10 * st > d, d, a, b) for st, d, a, b in grew]
+        if grew:
+            L += ["", "**Still climbing** (most views gained between the scans)",
+                  "| Group | Posted | Views then | Views now | Gained |", "|---|---|---|---|---|"]
+            for approx, d, a, b in grew[:8]:
+                v = f"[{fmt(b['views'])}]({b['url']})" if b.get("url") else fmt(b["views"])
+                L.append(f"| {b.get('group') or group_of(b)} | {b.get('date') or '?'} | {fmt(a['views'])} | {v} | "
+                         f"{'~' if approx else ''}+{fmt(d)} ({d / max(a['views'], 1) * 100:+.0f}%) |")
+            if any(t[0] for t in grew[:8]):
+                L += ["", "~ marks a gain on a rounded count where one rounding step is a tenth of the gain or more "
+                          "(TikTok shows views in 100s from 10K and in 100Ks from 1M; YouTube rounds counts outside "
+                          "--yt-enrich): read it as approximate, give or take one step."]
+        # a fixed yardstick: the earlier scan's own median, so a falling median can't make a flat post an outlier
+        crossed, unmeasured = [], {}
+        for a, b in both:
+            g = b.get("group") or group_of(b)
+            o = tg.get(g) or {}
+            m0 = o.get("median") if o.get("median_under") is None else None
+            if not m0 or not isinstance(o.get("tiers"), dict):
+                unmeasured[g] = ("not a group in the earlier scan" if not o else
+                                 "too many hidden view counts then" if o.get("median_under") is not None else
+                                 "no view counts then" if not o.get("with_views") else "too few posts with views then")
+                continue
+            if a.get("views") is not None and b.get("views") is not None and a["views"] < 2 * m0 <= b["views"] \
+                    and (b.get("lift") or 0) >= 2:  # 2x+ against both medians, so this report agrees
+                crossed.append((a, b, m0))
+        if crossed:
+            L += ["", f"**Became outliers since the last scan** (crossed 2x the earlier median): {len(crossed)}: "
+                  + ", ".join(f"[{fmt(b['views'])}]({b['url']}) ({b.get('group') or group_of(b)}: {fmt(a['views'])} → "
+                              f"{fmt(b['views'])} views, 2x the earlier median is {fmt(2 * m0)}; now {lift_txt(b)})"
+                              for a, b, m0 in sorted(crossed, key=lambda t: -t[1]["views"] / t[2])[:8]) + "."]
+        if unmeasured:
+            L += ["", "No outlier comparison for " + "; ".join(f"{g} ({why})" for g, why in sorted(unmeasured.items()))
+                  + ": the earlier median wasn't measurable."]
+    L.append("")
+    return L
+
+
+def seed_snapchat_history(out, prior=None):
+    """Start this folder's Snapchat history from the newest earlier dated folder
+    that has one (or, from before the history file, that folder's Spotlights),
+    so the history spans every run. `prior` names a folder to try first."""
+    if os.path.exists(os.path.join(out, SNAP_HISTORY)):
+        return
+    cands = older_scans(out, (SNAP_HISTORY, "posts_snapchat.json"))
+    if not cands and prior and not later_than(collected_on(prior)[0] or "", RUN_DAY.isoformat()):
+        cands = [prior]  # an undated layout: the named earlier scan is the only link
+    for src in cands:
+        try:
+            h = load(os.path.join(src, SNAP_HISTORY))
+        except (ValueError, OSError) as e:
+            print(f"  snapchat: couldn't read the history in {src} ({e}); trying its Spotlights", file=sys.stderr)
+            h = None
+        if h:
+            save(os.path.join(out, SNAP_HISTORY), h)
+            return
+        try:
+            old = load(os.path.join(src, "posts_snapchat.json"))
+        except (ValueError, OSError) as e:
+            print(f"  snapchat: couldn't read {src}/posts_snapchat.json ({e}); trying an older folder", file=sys.stderr)
+            continue
+        if old:
+            merge_snapchat_history(out, old, at=collected_on(src)[1] or collected_on(src)[0] or "earlier")
+            return
+
+
+def merge_snapchat_history(out, posts, at=None):
+    """Every Spotlight this folder (and the scans it was seeded from) has seen,
+    by id, with first and last seen and the counts at each pull. Logged out,
+    the profile lists only the newest Spotlights, so this is the only record
+    of the ones that scroll off."""
+    path = os.path.join(out, SNAP_HISTORY)
+    if at is None:
+        seed_snapchat_history(out)
+    try:
+        h = load(path) or {}
+    except ValueError:
+        os.replace(path, path + ".unreadable")
+        print(f"  snapchat: {SNAP_HISTORY} was unreadable; kept it as {SNAP_HISTORY}.unreadable and rebuilt it from "
+              "the earlier scans", file=sys.stderr)
+        if at is None:
+            seed_snapchat_history(out)
+        try:
+            h = load(path) or {}
+        except ValueError:
+            h = {}
+    runs, by_id = list(h.get("runs") or []), dict(h.get("posts") or {})
+    at = at or PULLED_AT
+    if at not in runs:
+        runs.append(at)
+    for p in posts:
+        e = dict(by_id.get(p["id"]) or {})
+        e.update({k: p.get(k) for k in ("url", "kind", "date", "posted_at", "duration_s", "caption")})
+        e["first_seen"] = min(e.get("first_seen") or at, at)
+        e["last_seen"] = max(e.get("last_seen") or at, at)
+        snap = {"at": at, **{k: p.get(k) for k in ("views", "views_hidden", "likes", "comments", "shares")}}
+        e["snapshots"] = sorted([s for s in e.get("snapshots") or [] if s.get("at") != at] + [snap],
+                                key=lambda s: s.get("at") or "")[-200:]
+        by_id[p["id"]] = e
+    save(path, {"runs": sorted(runs)[-1000:], "posts": by_id})
+
+
+def snapchat_history_lines(out):
+    try:
+        h = load(os.path.join(out, SNAP_HISTORY)) or {}
+        listed = {p.get("id") for p in load(os.path.join(out, "posts_snapchat.json"), []) or []}
+    except ValueError:
+        return []
+    allp, runs = h.get("posts") or {}, h.get("runs") or []
+    if not allp:
+        return []
+    gone = [e for i, e in allp.items() if i not in listed]
+    L = [f"**History:** {len(allp)} Spotlights seen across {len(runs)} pull{'' if len(runs) == 1 else 's'}"
+         + (f" since {str(runs[0])[:10]}" if runs else "") + f" ({SNAP_HISTORY})"
+         + (f"; {len(gone)} no longer listed on the profile, kept with their last counts" if gone else "") + "."]
+    last = lambda e: (e.get("snapshots") or [{}])[-1]
+    peak = lambda e: max([s.get("views") or 0 for s in e.get("snapshots") or []] or [0])
+    top = sorted(gone, key=peak, reverse=True)[:5]
+    if top:
+        L += ["", "**Most-viewed Spotlights no longer listed** (counts when last seen)",
+              "| Posted | Views | Likes | Last seen | Opening line |", "|---|---|---|---|---|"]
+        for e in top:
+            s = last(e)
+            v = f"[{fmt(s.get('views'))}]({e['url']})" if e.get("url") else fmt(s.get("views"))
+            L.append(f"| {e.get('date') or '?'} | {v} | {fmt(s.get('likes'))} | {str(e.get('last_seen'))[:10]} | "
+                     f"{cell(e.get('caption')) or '_(no caption)_'} |")
+    return L
+
+
+def report(out, name, since, note=None, prior="auto"):
+    """summary.md, summary.json and posts.csv, measured as of the day the
+    folder's data was collected, so a later re-render reads the same."""
+    with as_of(collected_on(out)[0]):
+        return build_report(out, name, since, note, prior)
+
+
+def build_report(out, name, since, note, prior):
     all_posts, metas, undated_dropped = load_posts(out, since)
     if not all_posts:
         total = len(load_posts(out)[0]) if since else 0
@@ -1813,6 +2231,17 @@ def report(out, name, since, note=None):
         if not os.path.exists(os.path.join(out, "podcast.json")):
             sys.exit("No posts found. Run collect / ingest-ig first.")
     groups = build_groups(all_posts, metas)
+    named = prior not in (None, "auto")
+    if prior == "auto":
+        prior = prior_scan(out)
+    if prior and os.path.abspath(prior) == os.path.abspath(out):
+        prior = None
+    if prior and since:  # a --since window isn't comparable with a whole earlier scan
+        if named:
+            msg = ("Since last scan left out: a --since report covers a date window, not the whole scan "
+                   "(run report without --since to compare)")
+            note(msg) if note else print(f"  report: {msg}", file=sys.stderr)
+        prior = None
 
     with open(os.path.join(out, "posts.csv"), "w", newline="") as f:
         cols = ["platform", "group", "kind", "date", "date_approx", "views", "lift", "tier", "eng_lift",
@@ -1825,8 +2254,9 @@ def report(out, name, since, note=None):
 
     if not name and not all_posts:  # a podcast-only folder
         name = (load(os.path.join(out, "podcast.json")) or {}).get("name")
+    pulled = collected_on(out, metas)[0] or TODAY.isoformat()
     L = [f"# Social scan: {name or os.path.basename(os.path.abspath(out))}",
-         f"Pulled {TODAY.isoformat()} from public, logged-out data."
+         f"Pulled {pulled} from public, logged-out data."
          + ((f" {len(all_posts)} posts" + (f" since {since}." if since else ".")) if all_posts else ""), ""]
 
     if metas:
@@ -1839,8 +2269,19 @@ def report(out, name, since, note=None):
         L.append("")
 
     L += podcast_section(out)
+    since_L = []
+    if prior:
+        try:
+            since_L = since_last(prior, {"pulled": pulled, "pulled_at": collected_on(out, metas)[1],
+                                         "accounts": metas, "groups": [g for _, g in groups],
+                                         "posts": all_posts, "podcast": load(os.path.join(out, "podcast.json"))},
+                                 name, out)
+        except (ValueError, OSError) as e:  # a damaged file in the earlier folder, or a folder that isn't earlier
+            msg = f"Since last scan left out: {e}"
+            note(msg) if note else print(f"  report: {msg}", file=sys.stderr)
+            prior = None
     if not all_posts:
-        return finish_report(out, name, L, groups, all_posts, metas)
+        return finish_report(out, name, L + since_L, groups, all_posts, metas, prior, since)
     L += ["## Scorecard",
           "| Group | Posts | Per week | Median views | Max | Top 3 share | Outliers 5x+ / 2-5x / 1.5-2x | Confidence | Like rate (n) | Comment rate | Followers per 1K views (proxy) |",
           "|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -1860,6 +2301,7 @@ def report(out, name, since, note=None):
         L.append(f"\n{approx_kept} posts kept by --since have approximate dates (un-enriched YouTube uploads), "
                  f"so some may be older than {since}.")
     L.append("")
+    L += since_L
 
     for _, s in groups:
         if not s.get("top"):
@@ -1930,7 +2372,11 @@ def report(out, name, since, note=None):
             L.append(f"| {p.get('date') or '?'}{flags(p)} | [{fmt(p['views'])}]({p['url']}) | {lift_txt(p)} | "
                      f"{fmt(p.get('likes'))} | {p['caption'] or '_(no caption)_'} |")
         if s["group"] == "snapchat spotlight":
-            L += [""] + spotlight_checks([p for p in all_posts if p["platform"] == "snapchat"], metas.get("snapchat") or {})
+            snaps = [p for p in all_posts if p["platform"] == "snapchat"]
+            L += [""] + spotlight_checks(snaps, metas.get("snapchat") or {})
+            hist = snapchat_history_lines(out)
+            if hist:
+                L += [""] + hist
         L.append("")
 
     if hooks_stale(out):
@@ -1972,19 +2418,22 @@ def report(out, name, since, note=None):
           "Photos and carousels aren't sampled. Pinned posts are shown but kept out of every window figure "
           "(reports before 2026-10-15 counted them in the median).",
           "- Reach, follows per post, retention and ad spend need the client's own analytics access."]
-    return finish_report(out, name, L, groups, all_posts, metas)
+    return finish_report(out, name, L, groups, all_posts, metas, prior, since)
 
 
-def finish_report(out, name, L, groups, all_posts, metas):
+def finish_report(out, name, L, groups, all_posts, metas, prior=None, since=None):
     with open(os.path.join(out, "summary.md"), "w") as f:
         f.write("\n".join(L) + "\n")
     slim = [{k: v for k, v in s.items() if k not in ("top", "bottom", "outliers", "duds")} for _, s in groups]
-    lifts = [{k: p.get(k) for k in ("platform", "group", "id", "url", "date", "date_approx", "views", "lift", "tier",
-                                    "eng_lift", "pinned")}
-             for p in all_posts if p.get("lift") is not None]
+    lifts = [{k: p.get(k) for k in ("platform", "group", "id", "url", "date", "date_approx", "views", "views_hidden",
+                                    "likes", "lift", "tier", "eng_lift", "pinned")}
+             for p in all_posts]  # every post, so the next scan's "Since last scan" knows what this one saw
     pod = load(os.path.join(out, "podcast.json"))
-    save(os.path.join(out, "summary.json"), {"pulled": TODAY.isoformat(), "name": name, "accounts": metas,
-                                             "groups": slim, "posts": lifts,
+    day, at = collected_on(out, metas, pod or {})
+    save(os.path.join(out, "summary.json"), {"pulled": day or TODAY.isoformat(), "pulled_at": at,
+                                             "rendered_at": PULLED_AT, "since": since, "name": name,
+                                             "prior": os.path.basename(os.path.abspath(prior)) if prior else None,
+                                             "accounts": metas, "groups": slim, "posts": lifts,
                                              **({"podcast": {k: v for k, v in pod.items() if k != "errors"}} if pod else {})})
     return os.path.join(out, "summary.md")
 
@@ -2255,6 +2704,9 @@ def scan(a):
                 note(f"podcast: couldn't read {err}")
         except Exception as e:
             note(f"podcast failed: {e}")
+    prior = None if a.no_prev else (a.prev or prior_scan(a.out))
+    if prior and a.snapchat:
+        seed_snapchat_history(a.out, prior)
     rp = os.path.join(a.out, "raw", "instagram_reels.json")
     for plat, h in todo:
         if plat in ("youtube", "tiktok") and not shutil.which(YTDLP):
@@ -2323,7 +2775,7 @@ def scan(a):
                  "or use a new --out folder if it's another show")
     posts, metas, _ = load_posts(a.out)
     if not posts and os.path.exists(pj):  # a podcast-only scan
-        path = report(a.out, a.name or pod_info.get("name"), None, note=note)
+        path = report(a.out, a.name or pod_info.get("name"), None, note=note, prior=prior)
         print(f"\nscan finished in {time.time() - t0:.0f} s", file=sys.stderr)
         if notes:
             print("Notes:", file=sys.stderr)
@@ -2394,9 +2846,11 @@ def scan(a):
                          + (f"the earlier ones ({kept} posts)" if kept else "left out"))
     prev = load(os.path.join(a.out, "summary.json"), {}) or {}
     name = a.name or (handle_of(todo[0][1]) if todo else None) or prev.get("name") or pod_info.get("name")
-    path = report(a.out, name, None, note=note)
+    path = report(a.out, name, None, note=note, prior=prior)
 
     print(f"\nscan finished in {time.time() - t0:.0f} s", file=sys.stderr)
+    if (load(os.path.join(a.out, "summary.json")) or {}).get("prior"):
+        print(f"  since last scan: compared with {os.path.relpath(prior)}", file=sys.stderr)
     for plat in PLATFORMS:
         n = sum(1 for p in posts if p["platform"] == plat)
         if n:
@@ -2448,6 +2902,9 @@ def main():
                    help="fetch likes/comments/exact dates for the newest N YouTube uploads (default 45, 0 = off)")
     s.add_argument("--no-hooks", action="store_true", help="skip the hooks step")
     s.add_argument("--no-comments", action="store_true", help="skip the comments step")
+    s.add_argument("--prev", help="an earlier scan folder of this account to compare with (default: the newest "
+                   "earlier dated folder beside --out)")
+    s.add_argument("--no-prev", action="store_true", help="leave out the Since last scan section")
 
     c = sub.add_parser("collect", help="collect posts only")
     c.add_argument("--out", required=True)
@@ -2490,10 +2947,30 @@ def main():
     r.add_argument("--out", required=True)
     r.add_argument("--name")
     r.add_argument("--since")
+    r.add_argument("--prev", help="an earlier scan folder to compare with (default: the newest earlier dated folder)")
+    r.add_argument("--no-prev", action="store_true", help="leave out the Since last scan section")
+
+    df = sub.add_parser("diff", help="what changed between two scan folders of one account (prints markdown)")
+    df.add_argument("old")
+    df.add_argument("new")
 
     a = ap.parse_args()
     if a.cmd == "doctor":
         sys.exit(doctor(a.get_model))
+    if a.cmd == "diff":
+        for d in (a.old, a.new):
+            if not os.path.isfile(os.path.join(d, "summary.json")):
+                sys.exit(f"{d} has no summary.json: diff compares two folders that each hold a report")
+        new = scan_state(a.new)
+        new["pulled"] = new["pulled"] or TODAY.isoformat()
+        old = scan_state(a.old)
+        if later_than(old["pulled_at"] or old["pulled"] or "", new["pulled_at"] or new["pulled"] or ""):
+            sys.exit(f"{a.new} was collected before {a.old}: diff takes the earlier folder first, then the later one")
+        print("\n".join(since_last(a.old, new, new.get("name"), a.new)))
+        return
+    for d in (getattr(a, "prev", None),):
+        if d and not os.path.isfile(os.path.join(d, "summary.json")):
+            sys.exit(f"--prev {d} has no summary.json: point it at an earlier scan folder of this account")
     os.makedirs(a.out, exist_ok=True)
     if a.cmd == "scan":
         scan(a)
@@ -2526,7 +3003,7 @@ def main():
     elif a.cmd == "comments":
         comments(a.out, a.top, a.max)
     elif a.cmd == "report":
-        print(report(a.out, a.name, a.since))
+        print(report(a.out, a.name, a.since, prior=None if a.no_prev else (a.prev or "auto")))
 
 
 if __name__ == "__main__":
