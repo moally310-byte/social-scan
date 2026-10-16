@@ -16,7 +16,7 @@ Start here
   doctor     [--get-model]   what's installed, what each missing piece turns off,
                              and the install line for macOS and Linux
   scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--name N] [--prev DIR]
-             [--tiktok-followers N] [--limit N] [--yt-enrich N] [--no-hooks] [--no-comments] [--no-prev]
+             [--tiktok-followers N] [--limit N | --days N] [--yt-enrich N] [--no-hooks] [--no-comments] [--no-prev]
                              collect, hooks, comments and report in one go;
                              a step whose tool is missing is skipped with a note.
                              Use one dated --out folder per account and run
@@ -25,13 +25,14 @@ Start here
                              earlier dated folder beside it.
 
 Single steps
-  collect    --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--limit N] [--yt-enrich N]
+  collect    --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--limit N | --days N] [--yt-enrich N]
   ingest-ig  --out DIR (--reels reels.json | --posts posts.json) [--profile profile.json]
   meta       --out DIR --platform P --followers N [--following N] [--source TEXT]
   hooks      --out DIR [--top N] [--bottom N] [--seconds S]
   comments   --out DIR [--top N] [--max N]
   report     --out DIR [--name NAME] [--since YYYY-MM-DD] [--prev DIR | --no-prev]
   diff       OLD NEW         what changed between two scan folders of one account
+  compare    DIR DIR ... [--out FILE]   one table across accounts, one scan folder each
 
 Outlier lift tiers and the hooks pass are adapted from ScrapeCreators'
 social-media-research-skills @ 64ba7b4 (MIT): outlier-post-finder and
@@ -237,12 +238,12 @@ def handle_of(h):
 
 # ---------- collectors ----------
 
-def collect_youtube(handle, out, limit, enrich):
+def collect_youtube(handle, out, limit, enrich, days=None):
     base = f"https://www.youtube.com/@{handle_of(handle)}"
     posts, followers, errs = [], None, []
     for tab, kind in (("videos", "long"), ("shorts", "short")):
         try:
-            d = ytdlp_json(f"{base}/{tab}", ["--playlist-end", str(limit),
+            d = ytdlp_json(f"{base}/{tab}", ["--playlist-end", str(DAYS_CAP if days else limit),
                                               "--extractor-args", "youtubetab:approximate_date"])
         except RuntimeError as e:
             errs.append(f"{tab}: {e}")
@@ -266,12 +267,67 @@ def collect_youtube(handle, out, limit, enrich):
 
     # Flat listings lack likes, comments and (for Shorts) dates. Fetch full
     # metadata for the newest N so the report can compute rates.
-    if enrich and posts:
-        def full(p):
-            try:
-                return p, ytdlp_json(f"https://www.youtube.com/watch?v={p['id']}", flat=False, timeout=90)
-            except Exception:
-                return p, None
+    def full(p):
+        try:
+            return p, ytdlp_json(f"https://www.youtube.com/watch?v={p['id']}", flat=False, timeout=90)
+        except Exception:
+            return p, None
+
+    def enrich_all(targets):
+        got = 0
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for p, d in ex.map(full, targets):
+                if not d:
+                    continue
+                got += 1
+                p["date"], p["date_approx"] = to_date(d), False
+                p["likes"] = num(d.get("like_count"))
+                p["comments"] = num(d.get("comment_count"))
+                p["duration_s"] = d.get("duration") or p["duration_s"]
+                v = num(d.get("view_count"))
+                p["views"] = v if v is not None else p["views"]
+        return got
+
+    window = None
+    if days and posts:
+        # a date window: long-form carries an approximate date ("3 weeks ago"), so
+        # enrich those within a month's slack of the cutoff; Shorts carry none, so
+        # enrich them newest first until one is older than the window
+        cutoff, slack = window_cutoff(days), window_cutoff(days + 31)
+        all_l = [p for p in posts if p["kind"] == "long"]
+        all_s = [p for p in posts if p["kind"] == "short"]
+        near = [p for p in all_l if not p["date"] or p["date"] >= slack]
+        enrich_all(near)
+        # a post whose page didn't answer has only the listing's "3 weeks ago", which can't place it in the window
+        longs = [p for p in near if not p["date_approx"]]
+        # yt-dlp's "3 weeks ago" is the latest an upload can be, so one dated before the cutoff (a couple of
+        # days' margin for month rounding) is out of the window for certain
+        edge = window_cutoff(days + 2)
+        undated = sum(1 for p in near if p["date_approx"] and (not p["date"] or p["date"] >= edge))
+        shorts, reached_s, tried = [], len(all_s) < DAYS_CAP, 0
+        for i in range(0, len(all_s), 12):
+            batch = all_s[i:i + 12]
+            tried += len(batch)
+            if not enrich_all(batch):  # YouTube refused every page in the batch: stop asking
+                reached_s = False
+                undated += len(batch)
+                break
+            past = [j for j, p in enumerate(batch) if p["date"] and p["date"] < cutoff]
+            cut = past[0] if past else len(batch)
+            shorts += [p for p in batch[:cut] if p["date"]]
+            undated += sum(1 for p in batch[:cut] if not p["date"])
+            if past:
+                reached_s = True
+                break
+        reached_l = len(all_l) < DAYS_CAP or len(near) < len(all_l) or any(p["date"] < cutoff for p in longs)
+        capped = (len(all_l) >= DAYS_CAP and not reached_l) or (len(all_s) >= DAYS_CAP and reached_s is False
+                                                               and tried >= DAYS_CAP)
+        newest = max((p["date"] for p in all_l + all_s if p.get("date")), default=None)
+        window = (reached_l and reached_s, capped, undated, newest)
+        posts = longs + shorts
+        print(f"  youtube: looked up {len(near) + tried} to find the last {days} days"
+              + (f"; {undated} couldn't be dated and are left out" if undated else ""), file=sys.stderr)
+    elif enrich and posts:
         # a third of the budget to the newest long-form, the rest to the newest
         # Shorts, then backfill unused slots from whichever kind has more
         all_l = [p for p in posts if p["kind"] == "long"]
@@ -280,20 +336,18 @@ def collect_youtube(handle, out, limit, enrich):
         shorts = all_s[: enrich - len(longs)]
         longs = all_l[: enrich - len(shorts)]
         targets = longs + shorts
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            for p, d in ex.map(full, targets):
-                if not d:
-                    continue
-                p["date"], p["date_approx"] = to_date(d), False
-                p["likes"] = num(d.get("like_count"))
-                p["comments"] = num(d.get("comment_count"))
-                p["duration_s"] = d.get("duration") or p["duration_s"]
-                v = num(d.get("view_count"))
-                p["views"] = v if v is not None else p["views"]
+        enrich_all(targets)
         print(f"  youtube: enriched {len(targets)} of {len(posts)}", file=sys.stderr)
 
     save(os.path.join(out, "posts_youtube.json"), posts)
     stamp(out, "youtube")
+    if window:
+        keep_window(out, "youtube", days, reached=window[0], capped=window[1], undated=window[2], newest=window[3])
+        posts = load(os.path.join(out, "posts_youtube.json"), []) or []
+        if not posts:
+            print(f"  youtube: no posts in the last {days} days", file=sys.stderr)
+    else:
+        forget_window(out, "youtube")
     if followers is not None:
         save(os.path.join(out, "meta_youtube.json"),
              {"followers": followers, "following": None, "source": "yt-dlp channel_follower_count",
@@ -336,7 +390,7 @@ def tiktok_kind(url):
     return ("photo", len(images), first)
 
 
-def collect_tiktok(handle, out, limit, quiet_followers=False):
+def collect_tiktok(handle, out, limit, quiet_followers=False, days=None):
     h, info = handle_of(handle), {}
     try:  # first, so a mistyped handle fails before the listing
         prof = tiktok_profile(h)
@@ -345,10 +399,28 @@ def collect_tiktok(handle, out, limit, quiet_followers=False):
             raise
         prof, info["followers_error"] = None, str(e)
         print(f"  tiktok: follower count not fetched ({e})", file=sys.stderr)
-    d = ytdlp_json(f"https://www.tiktok.com/@{h}", ["--playlist-end", str(limit)])
+    asked = min(max(limit, 60), DAYS_CAP) if days else limit
+    failed = False
+    d = ytdlp_json(f"https://www.tiktok.com/@{h}", ["--playlist-end", str(asked)])
+    window = None
+    if days:  # page on until the listing passes the cutoff (pinned posts sit first, so judge by the last)
+        cutoff = window_cutoff(days)
+        last = lambda d: to_date((d.get("entries") or [{}])[-1]) if d.get("entries") else None
+        if len(d.get("entries") or []) >= asked and (last(d) or "") >= cutoff and asked < DAYS_CAP:
+            try:
+                d, asked = ytdlp_json(f"https://www.tiktok.com/@{h}", ["--playlist-end", str(DAYS_CAP)]), DAYS_CAP
+            except RuntimeError as e:  # keep the listing already in hand; the window reads short
+                print(f"  tiktok: the longer listing failed ({e}); keeping the first {asked}", file=sys.stderr)
+                failed = True
+        reached = len(d.get("entries") or []) < asked or (last(d) or "") < cutoff
+        newest = max((to_date(e) for e in d.get("entries") or [] if to_date(e)), default=None)
+        window = (reached, not reached and not failed and len(d.get("entries") or []) >= DAYS_CAP, newest,
+                  f"TikTok's longer listing failed, so only the newest {asked} were read" if failed else None)
     save(os.path.join(out, "raw", "tiktok.json"), d)
     posts = []
     for e in d.get("entries") or []:
+        if days and (to_date(e) or "") < window_cutoff(days):
+            continue  # older than the window: no carousel check, no row
         posts.append({
             "platform": "tiktok", "kind": "video", "id": e.get("id"), "url": e.get("url"),
             "date": to_date(e), "date_approx": False, "duration_s": e.get("duration"),
@@ -358,7 +430,10 @@ def collect_tiktok(handle, out, limit, quiet_followers=False):
             "caption": first_line(e.get("description") or e.get("title")),
             "hook_text": first_line(e.get("description") or e.get("title"), 300),
         })
-    if not posts:
+    if not posts and days and d.get("entries"):
+        print(f"  tiktok: no posts in the last {days} days (the newest is from {window[2] or '?'})",
+              file=sys.stderr)
+    elif not posts:
         print("  tiktok: 0 posts (private, empty, or blocked)", file=sys.stderr)
     # a photo carousel's listed length is its song's, so carousels need telling
     # apart: their cover thumbnails sit under a "photomode" CDN path (matched the
@@ -385,6 +460,10 @@ def collect_tiktok(handle, out, limit, quiet_followers=False):
     info["unchecked"] = unchecked = sum(1 for k in kinds if k is None)
     save(os.path.join(out, "posts_tiktok.json"), posts)
     stamp(out, "tiktok")
+    if window:
+        keep_window(out, "tiktok", days, reached=window[0], capped=window[1], newest=window[2], reason=window[3])
+    else:
+        forget_window(out, "tiktok")
     if prof and prof["followers"] is not None:
         save(os.path.join(out, "meta_tiktok.json"), {"followers": prof["followers"], "following": prof["following"],
                                                      "source": "tiktok.com profile page, logged out",
@@ -1160,6 +1239,7 @@ def group_stats(name, posts, meta=None):
         s["outliers"] = [p for p in ranked if p["tier"]]
         # tier counts leave out posts under 3 days old; the table still shows them, marked fresh
         s["tiers"] = {name: sum(1 for p in settled if p["tier"] == name) for _, name in TIERS}
+        s["tier_n"] = len(settled)
         s["duds"] = [p for p in settled if med > 0 and p["views"] < 0.2 * med]
         # top 5 by views, extended to 10 rows only when more than 5 posts reach 1.5x
         s["top"] = s["outliers"][:10] if len(s["outliers"]) > 5 else ranked[:5]
@@ -1197,6 +1277,7 @@ def group_stats(name, posts, meta=None):
                 p["lift"] = round(p["views"] / med, 2) if med > 0 else None
                 p["tier"] = tier_of(p["lift"])
             s["tiers"] = {name: sum(1 for p in vis if p["tier"] == name) for _, name in TIERS}
+            s["tier_n"] = n  # hidden counts sit below every visible one, so they count as not outliers
             s["outliers"] = [p for p in vis_all if p["tier"]]
             s["top"] = s["outliers"][:10] if len(s["outliers"]) > 5 else vis_all[:5]
             s["bottom"] = (sorted(hidden, key=lambda p: p.get("likes") or 0) + vis[::-1])[:5]
@@ -1824,6 +1905,270 @@ def spotlight_checks(posts, meta):
     return L
 
 
+# ---------- collect windows (--days) ----------
+
+DAYS_CAP = 300  # posts per tab when collecting by --days
+
+
+def window_cutoff(days):
+    """The first day a --days window keeps: --days 30 is the 30 calendar days ending today."""
+    return (TODAY - dt.timedelta(days=days - 1)).isoformat()
+
+
+def keep_window(out, plat, days, reached=None, capped=False, undated=0, newest=None, reason=None):
+    """Trim a platform's collected posts to the last `days` days and record in
+    window.json what the window covers. reached: the listing went back past
+    the cutoff (None: judge it from the posts' own dates). undated: posts in
+    range left out because they couldn't be dated."""
+    path = os.path.join(out, f"posts_{plat}.json")
+    posts = load(path, []) or []
+    cutoff = window_cutoff(days)
+    dates = [p["date"] for p in posts if p.get("date") and not p.get("pinned")]
+    if reached is None:
+        reached = bool(dates and min(dates) < cutoff)
+    kept = [p for p in posts if not p.get("pinned") and (not p.get("date") or p["date"] >= cutoff)]
+    if kept:  # pinned posts ride along only with a window that has posts of its own
+        kept = [p for p in posts if p.get("pinned")] + kept
+    save(path, kept)
+    w = load(os.path.join(out, "window.json")) or {}
+    w[plat] = {"days": days, "cutoff": cutoff, "reached": bool(reached), "capped": bool(capped),
+               "from": min((p["date"] for p in kept if p.get("date") and not p.get("pinned")), default=None),
+               "newest": max(dates + ([newest] if newest else []), default=None), "posts": len(kept),
+               "left_out": len(posts) - len(kept), "undated": undated, "reason": reason}
+    save(os.path.join(out, "window.json"), w)
+
+
+def window_after(out, plat, days):
+    """--days for a platform with no paging (Snapchat) or a paid, count-capped scrape (Instagram): trim to the window."""
+    if not days:
+        forget_window(out, plat)
+        return
+    reached = None
+    if plat == "snapchat" and not (load(os.path.join(out, "meta_snapchat.json")) or {}).get("more_exist", True):
+        reached = True  # the profile listed every Spotlight
+    keep_window(out, plat, days, reached=reached)
+
+
+def collect_instagram_window(handle, out, limit, days):
+    t0 = time.time()
+    try:
+        collect_instagram(handle, out, limit)
+    finally:
+        pi = os.path.join(out, "posts_instagram.json")
+        if os.path.exists(pi) and os.path.getmtime(pi) >= t0:
+            window_after(out, "instagram", days)
+
+
+def forget_window(out, plat):
+    """A collect by post count replaces any earlier window for that platform."""
+    path = os.path.join(out, "window.json")
+    w = load(path) or {}
+    if plat in w:
+        w.pop(plat)
+        save(path, w)
+
+
+def empty_window(v):
+    """A window with no posts because the account posted nothing in it (not a
+    blocked listing, and not posts YouTube refused to date)."""
+    return not v.get("posts") and not v.get("undated") and v.get("newest") is not None
+
+
+def window_lines(out, platforms):
+    """The report's note on a collect by --days, and where a platform falls short of it."""
+    w = load(os.path.join(out, "window.json")) or {}
+    if not w:
+        return []
+    ds = sorted({v["days"] for v in w.values()})
+    L = [f"Collected by date: the last {' / '.join(str(d) for d in ds)} day{'' if ds == [1] else 's'} "
+         f"(--days), from {min(v['cutoff'] for v in w.values())}."
+         + ("" if set(platforms) <= set(w) else f" Only {', '.join(sorted(w))} came that way; "
+            f"{', '.join(sorted(set(platforms) - set(w)))} came by post count.")]
+    empty = [f"{k} (its newest post is from {v['newest']})" for k, v in sorted(w.items()) if empty_window(v)]
+    if empty:
+        L.append("**No posts in the window:** " + "; ".join(empty) + ".")
+    short = [f"{k} reaches back only to {v.get('from') or '?'} ("
+             + (v["reason"] if v.get("reason") else "it hit the {}-post cap".format(DAYS_CAP) if v.get("capped") else
+                "Snapchat lists only its newest Spotlights logged out" if k == "snapchat" else
+                "Instagram's paid scrape stops at --limit" if k == "instagram" else
+                "YouTube stopped answering the per-video lookups that date its posts" if k == "youtube" else
+                "the listing ends there") + ")"
+             for k, v in sorted(w.items()) if v.get("posts") and not v.get("reached")]
+    short += [f"{k}: {v['undated']} post{'s' if v['undated'] != 1 else ''} in range couldn't be dated (YouTube refused "
+              "their pages) and are left out" for k, v in sorted(w.items()) if v.get("undated")]
+    if short:
+        L.append("**Short window:** " + "; ".join(short) + ". Those numbers cover less than the window.")
+    return L
+
+
+def group_days(window, g, posts=None):
+    """Days a group's posts cover: the --days window when its platform reached
+    back that far, else the first-to-last span of its dated posts. None when
+    undated posts make the span unknowable (Shorts past --yt-enrich)."""
+    plat = g["group"].split()[0]
+    w = (window or {}).get(plat)
+    if w and w.get("reached") and not w.get("undated"):
+        return w["days"]
+    if posts is not None and any(not p.get("date") and not p.get("pinned") for p in posts
+                                 if p.get("group") == g["group"]):
+        return None
+    try:
+        return (dt.date.fromisoformat(g["last"]) - dt.date.fromisoformat(g["first"])).days + 1
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def window_cadence(groups, window, since=None):
+    """In a --days window that reached back, per week is the posts over the
+    window itself (or over a --since range inside it)."""
+    for plat, g in groups:
+        w = (window or {}).get(plat)
+        if w and w.get("reached") and w.get("days"):
+            exact = g.get("cadence_n") if g.get("cadence_n") is not None else g.get("posts")
+            days, start = w["days"], w.get("cutoff")
+            if since and start and since > start:
+                days, start = (TODAY - dt.date.fromisoformat(since)).days + 1, since
+            g["per_week"] = round(exact / (days / 7), 1)
+            g["cadence_from"] = start
+    return groups
+
+
+# ---------- compare ----------
+
+def compare(dirs):
+    """One table across accounts (one scan folder each): window, cadence,
+    median, outlier rate, top-3 share and followers per 1K per group, each
+    folder measured as of the day it was collected. Medians and followers per
+    1K are left out where the windows differ too much to compare."""
+    states, notes = [], []
+    for d in dirs:
+        if not load_posts(d)[0]:
+            notes.append(f"{d}: no collected posts, left out")
+            continue
+        st = scan_state(d)
+        st["dir"] = d
+        base = os.path.basename(os.path.abspath(d))
+        st["label"] = st["name"] or (f"{os.path.basename(os.path.dirname(os.path.abspath(d)))}/{base}"
+                                     if DATED_DIR.match(base) else base)
+        states.append(st)
+    if not states:
+        raise ValueError("none of those folders holds collected posts")
+    seen = {}
+    for st in states:  # two scans of one account: tell them apart by folder
+        seen[st["label"]] = seen.get(st["label"], 0) + 1
+    for st in states:
+        if seen[st["label"]] > 1:
+            st["label"] += f" ({os.path.basename(os.path.abspath(st['dir']))})"
+
+    days = lambda st, g: group_days(st["window"], g, st["posts"])
+    L = ["# Compare: " + ", ".join(st["label"] for st in states), "",
+         "| Account | Followers | Collected | Window |", "|---|---|---|---|"]
+    for st in states:
+        foll = ", ".join(f"{k} {fmt(v.get('followers'))}" for k, v in sorted((st["accounts"] or {}).items())
+                         if v.get("followers") is not None) or "n/a"
+        ws = sorted({v["days"] for v in st["window"].values()})
+        L.append(f"| {st['label']} | {foll} | {st['pulled'] or '?'} | "
+                 + (f"last {'/'.join(map(str, ws))} days" if ws else "by post count") + " |")
+    pulled = sorted(st["pulled"] for st in states if st["pulled"])
+    if len(pulled) > 1 and (dt.date.fromisoformat(pulled[-1]) - dt.date.fromisoformat(pulled[0])).days > 2:
+        L += ["", f"**Collected on different days** ({pulled[0]} to {pulled[-1]}): the same --days covers different "
+                  "dates, and older scans have had longer to gather views. Scan them within a day or two of each other "
+                  "for a fair table."]
+    groups = sorted({g["group"] for st in states for g in st["groups"]})
+    # per group, the window most accounts share (two or more); a row more than 1.5x off it, or any row when no
+    # two accounts share a window, can't compare medians
+    near = lambda a, b: max(a, b) / min(a, b) <= 1.5
+    ref = {}
+    for gr in groups:
+        ds = [days(st, g) for st in states for g in st["groups"] if g["group"] == gr]
+        if len(ds) < 2:
+            continue
+        known = [x for x in ds if x]
+        best = max(known, key=lambda d: (sum(near(d, x) for x in known), -d), default=None)
+        ref[gr] = best if best and sum(near(best, x) for x in known) >= 2 else None
+    off = lambda gr, w: gr in ref and (ref[gr] is None or not w or not near(w, ref[gr]))
+    def clean(st, plat):  # a --days window that reached back with nothing left undated, else None
+        w = st["window"].get(plat)
+        return w["days"] if w and w.get("reached") and not w.get("undated") else None
+
+    fp_days = {}
+    for plat in {g.split()[0] for g in groups}:
+        have = [st for st in states if any(x["group"].split()[0] == plat for x in st["groups"])]
+        ds = [clean(st, plat) for st in have if clean(st, plat)]
+        if len(have) == 1:  # one account alone: nothing to set it beside
+            fp_days[plat] = "alone"
+        else:
+            top = max(set(ds), key=ds.count) if ds else None
+            fp_days[plat] = top if top and ds.count(top) >= 2 else None
+    L += ["", "| Group | Account | Window (days) | Posts | Per week | Median views | Outlier rate (2x+) | Top 3 share | "
+              "Followers per 1K | Confidence (n) |", "|---|---|---|---|---|---|---|---|---|---|"]
+    uneven, short_rows, fresh_rows = set(), [], []
+    for gr in groups:
+        plat = gr.split()[0]
+        for st in states:
+            g = next((x for x in st["groups"] if x["group"] == gr), None)
+            if not g:
+                has = any(x["group"].split()[0] == plat for x in st["groups"])
+                win = st["window"].get(plat) or {}
+                why = ("none in this scan" if has else
+                       f"no posts in the last {win['days']} days" + (f" (newest {win['newest']})" if win.get("newest") else "")
+                       if win else f"{plat} not collected")
+                L.append(f"| {gr} | {st['label']} | – | 0 | – | – | – | – | – | {why} |")
+                continue
+            w = days(st, g)
+            hide = off(gr, w)
+            # followers per 1K covers the whole platform and scales with the window's length, so it shows only
+            # where this platform's window is a clean --days of the length the other accounts' clean windows share
+            plat_off = fp_days.get(plat) is None or (fp_days[plat] != "alone" and clean(st, plat) != fp_days[plat])
+            if hide:
+                uneven.add(gr)
+            med = "–" if hide else (f"under {fmt(g['median_under'])}" if g.get("median_under") is not None
+                                    else fmt(g.get("median")))
+            fp = "–" if plat_off else (g.get("followers_per_1k") or "n/a")
+            t = g.get("tiers")
+            tn = g.get("tier_n", g.get("baseline_n"))
+            hit = (t.get("huge", 0) + t.get("strong", 0)) / tn if isinstance(t, dict) and tn and tn >= 5 else None
+            t3 = ("≤" if g.get("top3_upper") and g.get("top3_share") is not None else "") + pct(g.get("top3_share"))
+            win = st["window"].get(plat) or {}
+            short = bool(win) and (not win.get("reached") or win.get("undated"))
+            if short:
+                short_rows.append(f"{st['label']} {gr} (" + ("didn't reach back the whole --days" if not win.get("reached")
+                                                          else f"{win['undated']} in range couldn't be dated") + ")")
+            if g.get("all_fresh"):
+                fresh_rows.append(f"{st['label']} {gr}")
+            L.append(f"| {gr} | {st['label']} | {w or '?'}{' (short)' if short else ''} | {g['posts']} | "
+                     f"{g.get('per_week', 'n/a')} | {med} | {'n/a' if hit is None else f'{hit * 100:.0f}%'} | {t3} | "
+                     f"{fp} | {g['confidence']} ({g['baseline_n']}){', fresh' if g.get('all_fresh') else ''} |")
+    if uneven:
+        L += ["", f"**Windows differ** in {', '.join(sorted(uneven))}: where an account's window is more than 1.5 times "
+                  "off the one the others share (or no two share one), its median views are left out (–), since median "
+                  "views move with how many days a window covers. Scan every account with the same --days to compare "
+                  "them; cadence and outlier rate are each account's own and still compare."]
+    if short_rows:
+        L += ["", "**Short window:** " + "; ".join(short_rows) + ": these rows cover less than the window (the scan's "
+                  "report says why)."]
+    if fresh_rows:
+        L += ["", "**Fresh:** " + "; ".join(fresh_rows) + ": every post is under 3 days old, so the median and outlier "
+                  "rate use unsettled posts and will still move. Don't set them beside settled rows."]
+    best = []
+    for st in states:
+        scored = [(g["tiers"].get("huge", 0) + g["tiers"].get("strong", 0), g["group"]) for g in st["groups"]
+                  if isinstance(g.get("tiers"), dict)]
+        if scored and max(scored)[0]:
+            n = max(scored)[0]
+            best.append(f"{st['label']}: {max(scored)[1]} ({n} post{'' if n == 1 else 's'} at 2x+)")
+    if best:
+        L += ["", "**Best format** (most posts at 2x+ their own median): " + "; ".join(best) + "."]
+    L += ["", "Outlier rate is the share of each group's settled posts at 2x+ its own median (n/a under 5), so it "
+              "compares across accounts of any size; raw views don't. Top 3 share depends on how many posts the window "
+              "holds, so compare it only between rows with similar post counts. Followers per 1K scales with the window's "
+              "length, so it's shown only where accounts were scanned with the same --days and reached back the whole "
+              "window."]
+    if notes:
+        L += ["", "Left out: " + "; ".join(notes) + "."]
+    return "\n".join(L) + "\n"
+
+
 # ---------- run history ----------
 
 # a scan folder is named for its date, with an optional short run marker:
@@ -1926,10 +2271,11 @@ def scan_state(folder):
     pod = load(os.path.join(folder, "podcast.json")) or so.get("podcast")
     day, at = collected_on(folder, metas, pod or {})
     posts = [dict(p) for p in raw]
+    window = load(os.path.join(folder, "window.json")) or {}
     with as_of(day):
-        groups = [g for _, g in build_groups(posts, metas)]
+        groups = [g for _, g in window_cadence(build_groups(posts, metas), window)]
     return {"pulled": day, "pulled_at": at, "name": so.get("name"), "accounts": metas, "groups": groups,
-            "posts": posts, "podcast": pod}
+            "posts": posts, "podcast": pod, "window": window}
 
 
 def step(p):
@@ -2015,11 +2361,7 @@ def since_last(prior, now, name, out):
             return "n/a"
         return ("≤" if s.get("top3_upper") and s.get("top3_share") is not None else "") + pct(s.get("top3_share"))
 
-    def span(s):  # days the group's posts cover, both ends counted
-        try:
-            return (dt.date.fromisoformat(s["last"]) - dt.date.fromisoformat(s["first"])).days + 1
-        except (KeyError, TypeError, ValueError):
-            return None
+    now_win = now.get("window") or {}
 
     tg = {g.get("group"): g for g in then["groups"]}
     ng = [g for g in now["groups"] if isinstance(g, dict)]
@@ -2032,17 +2374,23 @@ def since_last(prior, now, name, out):
             L.append(f"| {g['group']} | {o.get('posts', 'n/a')} | {g.get('posts')} | {med(o)} | {med(g)} | "
                      f"{o.get('per_week', 'n/a') if o else 'n/a'} | {g.get('per_week', 'n/a')} | {x2(o)} | {x2(g)} | "
                      f"{t3(o)} | {t3(g)} |")
-            a, b = span(o) if o else None, span(g)
+            a, b = group_days(then.get("window"), o, then["posts"]) if o else None, group_days(now_win, g, now["posts"])
+            part = a is None or b is None  # undated posts (Shorts past --yt-enrich): fall back to the dated span
+            dspan = lambda x: group_days(None, x) if x else None
+            a, b = (a or dspan(o)), (b or dspan(g))
+            dd = lambda n: f"{n} day{'' if n == 1 else 's'}"
             if a and b and max(a, b) / min(a, b) > 1.5:
-                dd = lambda n: f"{n} day{'' if n == 1 else 's'}"
                 uneven.append((g["group"], f"{g['group']} covered {dd(a)} with {o.get('posts')} posts then, "
-                                           f"{dd(b)} with {g.get('posts')} now"))
+                                           f"{dd(b)} with {g.get('posts')} now"
+                                           + (" (dated posts only: some had no date)" if part else "")))
+            elif o and part and not (a and b):
+                uneven.append((g["group"], f"{g['group']}: its window is unknown in one scan (posts with no date)"))
         if uneven:
             snap = any(k.startswith("snapchat") for k, _ in uneven)
             other = any(not k.startswith("snapchat") for k, _ in uneven)
             L += ["", "**Different windows:** " + "; ".join(t for _, t in uneven) + ". A window more than 1.5 times "
                   "longer in one scan means part of these changes is the window, not the content: quote those rows "
-                  "with that caveat" + (", or scan again with a --limit that covers a similar range" if other else "")
+                  "with that caveat" + (", or scan both with the same --days" if other else "")
                   + (". Snapchat lists only its newest Spotlights logged out, so compare Snapchat scans taken at a "
                      "similar interval" if snap else "") + "."]
         dropped = [k for k in tg if k not in {g["group"] for g in ng}]
@@ -2190,12 +2538,13 @@ def merge_snapchat_history(out, posts, at=None):
 def snapchat_history_lines(out):
     try:
         h = load(os.path.join(out, SNAP_HISTORY)) or {}
-        listed = {p.get("id") for p in load(os.path.join(out, "posts_snapchat.json"), []) or []}
     except ValueError:
         return []
     allp, runs = h.get("posts") or {}, h.get("runs") or []
     if not allp:
         return []
+    latest = max(runs) if runs else None
+    listed = {i for i, e in allp.items() if latest and e.get("last_seen") == latest}
     gone = [e for i, e in allp.items() if i not in listed]
     L = [f"**History:** {len(allp)} Spotlights seen across {len(runs)} pull{'' if len(runs) == 1 else 's'}"
          + (f" since {str(runs[0])[:10]}" if runs else "") + f" ({SNAP_HISTORY})"
@@ -2230,7 +2579,7 @@ def build_report(out, name, since, note, prior):
                      "or leave out --since.")
         if not os.path.exists(os.path.join(out, "podcast.json")):
             sys.exit("No posts found. Run collect / ingest-ig first.")
-    groups = build_groups(all_posts, metas)
+    groups = window_cadence(build_groups(all_posts, metas), load(os.path.join(out, "window.json")), since)
     named = prior not in (None, "auto")
     if prior == "auto":
         prior = prior_scan(out)
@@ -2257,7 +2606,8 @@ def build_report(out, name, since, note, prior):
     pulled = collected_on(out, metas)[0] or TODAY.isoformat()
     L = [f"# Social scan: {name or os.path.basename(os.path.abspath(out))}",
          f"Pulled {pulled} from public, logged-out data."
-         + ((f" {len(all_posts)} posts" + (f" since {since}." if since else ".")) if all_posts else ""), ""]
+         + ((f" {len(all_posts)} posts" + (f" since {since}." if since else ".")) if all_posts else "")]
+    L += window_lines(out, sorted({p["platform"] for p in all_posts})) + [""]
 
     if metas:
         L += ["## Accounts", "| Platform | Followers | Following | Source |", "|---|---|---|---|"]
@@ -2273,6 +2623,7 @@ def build_report(out, name, since, note, prior):
     if prior:
         try:
             since_L = since_last(prior, {"pulled": pulled, "pulled_at": collected_on(out, metas)[1],
+                                         "window": load(os.path.join(out, "window.json")) or {},
                                          "accounts": metas, "groups": [g for _, g in groups],
                                          "posts": all_posts, "podcast": load(os.path.join(out, "podcast.json"))},
                                  name, out)
@@ -2431,6 +2782,7 @@ def finish_report(out, name, L, groups, all_posts, metas, prior=None, since=None
     pod = load(os.path.join(out, "podcast.json"))
     day, at = collected_on(out, metas, pod or {})
     save(os.path.join(out, "summary.json"), {"pulled": day or TODAY.isoformat(), "pulled_at": at,
+                                             "window": load(os.path.join(out, "window.json")) or None,
                                              "rendered_at": PULLED_AT, "since": since, "name": name,
                                              "prior": os.path.basename(os.path.abspath(prior)) if prior else None,
                                              "accounts": metas, "groups": slim, "posts": lifts,
@@ -2719,16 +3071,22 @@ def scan(a):
         ran.append(plat)
         try:  # one platform failing shouldn't sink the others
             if plat == "youtube":
-                collect_youtube(h, a.out, a.limit, a.yt_enrich)
+                collect_youtube(h, a.out, a.limit, a.yt_enrich, days=a.days)
             elif plat == "tiktok":
-                info = collect_tiktok(h, a.out, a.limit, quiet_followers=True) or {}  # the recap prints the follow-up
+                info = collect_tiktok(h, a.out, a.limit, quiet_followers=True, days=a.days) or {}  # the recap prints the follow-up
                 followers_error = info.get("followers_error")
             elif plat == "snapchat":
                 collect_snapchat(h, a.out)
+                window_after(a.out, "snapchat", a.days)
             else:
                 print(f"  instagram: Apify reels scrape, about $0.11 per 40 reels, capped at ${IG_MAX_USD:.2f} per call",
                       file=sys.stderr)
-                collect_instagram(h, a.out, min(a.limit, 50))
+                try:
+                    collect_instagram(h, a.out, min(a.limit, 50))
+                finally:  # the reels are saved before the follower call, so trim them even if it fails
+                    pi = os.path.join(a.out, "posts_instagram.json")
+                    if os.path.exists(pi) and os.path.getmtime(pi) >= t0:
+                        window_after(a.out, "instagram", a.days)
         except Exception as e:
             msg = f"{plat} failed: {redact(e)}"
             pi = os.path.join(a.out, "posts_instagram.json")
@@ -2763,6 +3121,11 @@ def scan(a):
                 note(f"{plat}: the follower count ({fmt(m.get('followers'))}) is from an earlier run, pulled "
                      f"{m.get('pulled', '?')};{flag} or use a new --out folder if it's another account's")
 
+    pi = os.path.join(a.out, "posts_instagram.json")
+    if a.days and "instagram" not in dict(todo) and os.path.exists(pi) and t0 - os.path.getmtime(pi) < 6 * 3600 \
+            and "instagram" not in (load(os.path.join(a.out, "window.json")) or {}):
+        window_after(a.out, "instagram", a.days)  # SKILL.md step 3: reels ingested through the Apify MCP just before
+        note(f"instagram: the ingested reels were trimmed to the last {a.days} days")
     pj = os.path.join(a.out, "podcast.json")
     if os.path.exists(pj) and os.path.getmtime(pj) < t0:
         old = load(pj) or {}
@@ -2787,6 +3150,12 @@ def scan(a):
         for n in notes:
             print(f"  - {n}", file=sys.stderr)
         failed = [n for n in notes if " failed: " in n]
+        wins = load(os.path.join(a.out, "window.json")) or {}
+        empty = {k: v for k, v in wins.items() if empty_window(v)}
+        if a.days and empty and len(empty) == len([k for k in wins if not wins[k].get("posts")]):
+            sys.exit(f"No posts in the last {a.days} days, so there's no report: "
+                     + "; ".join(f"{k}'s newest is from {v.get('newest') or '?'}" for k, v in sorted(empty.items()))
+                     + ". Widen --days, or leave it out to collect by post count.")
         if not ran:
             hint = "The notes above say what was skipped; `doctor` shows what's missing."
         elif failed and all("(check the handle)" in n for n in failed):
@@ -2898,6 +3267,9 @@ def main():
     s.add_argument("--name", help="report title (default: the first handle, or the show's name for a podcast-only scan)")
     s.add_argument("--tiktok-followers", type=int, help="override the TikTok follower count scan reads off the profile page")
     s.add_argument("--limit", type=int, default=60, help="posts per tab/profile (default 60; Instagram max 50)")
+    s.add_argument("--days", type=int, help=f"collect the last N days instead of a post count (up to {DAYS_CAP} posts "
+                   "per tab; YouTube looks up every post in the window to date it, whatever --yt-enrich says; "
+                   "Instagram and Snapchat are trimmed to the window)")
     s.add_argument("--yt-enrich", type=int, default=45,
                    help="fetch likes/comments/exact dates for the newest N YouTube uploads (default 45, 0 = off)")
     s.add_argument("--no-hooks", action="store_true", help="skip the hooks step")
@@ -2915,6 +3287,7 @@ def main():
     c.add_argument("--podcast", help="show name, Apple Podcasts ID or podcasts.apple.com link: chart ranks, rating, reviews, "
                    "episode cadence (free)")
     c.add_argument("--limit", type=int, default=60, help="posts per tab/profile (default 60)")
+    c.add_argument("--days", type=int, help=f"collect the last N days instead of a post count (up to {DAYS_CAP} per tab)")
     c.add_argument("--yt-enrich", type=int, default=45,
                    help="fetch likes/comments/exact dates for the newest N YouTube uploads (default 45, 0 = off)")
 
@@ -2924,6 +3297,7 @@ def main():
     src.add_argument("--reels", help=f"{IG_REELS_ACTOR} dataset JSON (contiguous newest reels)")
     src.add_argument("--posts", help="older apify/instagram-scraper posts-feed JSON; readable, but flagged unreliable")
     i.add_argument("--profile")
+    i.add_argument("--days", type=int, help="trim the ingested reels to the last N days (match the scan's --days)")
 
     m = sub.add_parser("meta", help="record a follower count by hand")
     m.add_argument("--out", required=True)
@@ -2954,6 +3328,10 @@ def main():
     df.add_argument("old")
     df.add_argument("new")
 
+    cp = sub.add_parser("compare", help="one table across accounts, one scan folder each (prints markdown)")
+    cp.add_argument("dirs", nargs="+", metavar="DIR")
+    cp.add_argument("--out", dest="compare_out", help="also write the table to this file")
+
     a = ap.parse_args()
     if a.cmd == "doctor":
         sys.exit(doctor(a.get_model))
@@ -2968,6 +3346,18 @@ def main():
             sys.exit(f"{a.new} was collected before {a.old}: diff takes the earlier folder first, then the later one")
         print("\n".join(since_last(a.old, new, new.get("name"), a.new)))
         return
+    if a.cmd == "compare":
+        try:
+            md = compare(a.dirs)
+        except ValueError as e:
+            sys.exit(str(e))
+        if a.compare_out:
+            with open(a.compare_out, "w") as f:
+                f.write(md)
+        print(md, end="")
+        return
+    if getattr(a, "days", None) is not None and a.days < 1:
+        sys.exit("--days needs a number of days, 1 or more")
     for d in (getattr(a, "prev", None),):
         if d and not os.path.isfile(os.path.join(d, "summary.json")):
             sys.exit(f"--prev {d} has no summary.json: point it at an earlier scan folder of this account")
@@ -2977,10 +3367,10 @@ def main():
     elif a.cmd == "collect":
         if not (a.youtube or a.tiktok or a.instagram or a.snapchat or a.podcast):
             sys.exit("collect needs at least one of --youtube, --tiktok, --instagram, --snapchat, --podcast")
-        for flag, fn in ((a.youtube, lambda: collect_youtube(a.youtube, a.out, a.limit, a.yt_enrich)),
-                         (a.tiktok, lambda: collect_tiktok(a.tiktok, a.out, a.limit)),
-                         (a.instagram, lambda: collect_instagram(a.instagram, a.out, min(a.limit, 50))),
-                         (a.snapchat, lambda: collect_snapchat(a.snapchat, a.out)),
+        for flag, fn in ((a.youtube, lambda: collect_youtube(a.youtube, a.out, a.limit, a.yt_enrich, days=a.days)),
+                         (a.tiktok, lambda: collect_tiktok(a.tiktok, a.out, a.limit, days=a.days)),
+                         (a.instagram, lambda: collect_instagram_window(a.instagram, a.out, min(a.limit, 50), a.days)),
+                         (a.snapchat, lambda: (collect_snapchat(a.snapchat, a.out), window_after(a.out, "snapchat", a.days))),
                          (a.podcast, lambda: collect_podcast(a.podcast, a.out))):
             if not flag:
                 continue
@@ -2990,6 +3380,7 @@ def main():
                 print(f"  FAILED: {redact(e)}", file=sys.stderr)
     elif a.cmd == "ingest-ig":
         ingest_ig(a.reels or a.posts, a.profile, a.out, feed="reels" if a.reels else "posts")
+        window_after(a.out, "instagram", a.days)
     elif a.cmd == "meta":  # merge, so a collector's extra fields (Snapchat's Story counts) survive
         mp = os.path.join(a.out, f"meta_{a.platform}.json")
         m = load(mp, {}) or {}
