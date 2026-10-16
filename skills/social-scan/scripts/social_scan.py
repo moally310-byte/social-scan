@@ -309,7 +309,10 @@ def collect_youtube(handle, out, limit, enrich, days=None):
                 p["comments"] = num(d.get("comment_count"))
                 p["duration_s"] = d.get("duration") or p["duration_s"]
                 v = num(d.get("view_count"))
-                p["views"] = v if v is not None else p["views"]
+                if p.get("top_lookup"):  # a top post keeps its listed (rounded) count, as its neighbours do
+                    p["views_exact"] = v
+                else:
+                    p["views"] = v if v is not None else p["views"]
         return got
 
     window = None
@@ -2815,7 +2818,7 @@ def step(p):
         return 0
     if p.get("platform") == "tiktok":
         return 100_000 if v >= 1_000_000 and v % 100_000 == 0 else 100 if v >= 10_000 and v % 100 == 0 else 0
-    if p.get("platform") == "youtube" and p.get("likes") is None and v >= 1000:
+    if p.get("platform") == "youtube" and (p.get("likes") is None or p.get("top_lookup")) and v >= 1000:
         return 10 ** (len(str(int(v))) - 2)
     return 0
 
@@ -3100,6 +3103,10 @@ def report(out, name, since, note=None, prior="auto", tz=None):
 
 def build_report(out, name, since, note, prior, tz=None):
     all_posts, metas, undated_dropped = load_posts(out, since)
+    # the top-post lookups among the whole folder's posts, and those --since left out (it reads them as listed)
+    every = load_posts(out)[0] if since else all_posts
+    lookups = sum(1 for p in every if p.get("top_lookup"))
+    lookups_dropped = sum(1 for p in every if p.get("top_lookup") and not as_listed(p)[0]) if since else 0
     backfill_times(out, all_posts)
     if not all_posts:
         total = len(load_posts(out)[0]) if since else 0
@@ -3175,7 +3182,10 @@ def build_report(out, name, since, note, prior, tz=None):
                  f"{fmt(s.get('max'))} | {t3} | {tiers} | {s['confidence']} ({s['baseline_n']}) | "
                  f"{pct(s['like_rate'])}{rn} | {pct(s['comment_rate'])} | {s.get('followers_per_1k') or 'n/a'} |")
     if undated_dropped:
-        L.append(f"\n{undated_dropped} undated posts left out by --since (un-enriched YouTube Shorts).")
+        L.append(f"\n{undated_dropped} posts with no listed date left out by --since (YouTube Shorts past --yt-enrich"
+                 + (f"; {lookups_dropped} of them are top posts looked up for the top-posts tables, which --since reads "
+                    "as listed, so the window's numbers match a scan without those lookups" if lookups_dropped else "")
+                 + ").")
     approx_kept = sum(1 for p in all_posts if as_listed(p)[0] and as_listed(p)[1]) if since else 0
     if approx_kept:
         L.append(f"\n{approx_kept} posts kept by --since have approximate dates (un-enriched YouTube uploads), "
@@ -3229,7 +3239,7 @@ def build_report(out, name, since, note, prior, tz=None):
         if tl:
             L.append(f"{tl} top post{'' if tl == 1 else 's'} older than the newest --yt-enrich run "
                      f"{'was' if tl == 1 else 'were'} looked up for {'its' if tl == 1 else 'their'} date and likes; "
-                     "everything sampled (dates above, cadence, rates, the format tables) counts "
+                     "everything sampled (views, dates above, cadence, rates, the format tables) counts "
                      f"{'it' if tl == 1 else 'them'} as listed, so a top post can sit outside this range.")
         if s["pinned"]:
             L.append(f"{s['pinned']} pinned posts are listed for reference but sit outside the window: they stay out of "
@@ -3298,8 +3308,8 @@ def build_report(out, name, since, note, prior, tz=None):
              "summary.json, approx in the tables): YouTube only says \"3 months ago\", so the real upload can be "
              "months earlier. Per week and the gap check use exact dates only. Shorts without enrichment have no date."
              + (f" The top {TOP_LOOKUPS} of each kind by views were looked up too, for their dates and likes "
-                "(top_lookup in posts.csv); cadence, rates, --since and the format tables still read them as listed."
-                if any(p.get("top_lookup") for p in all_posts) else "")]
+                "(top_lookup in posts.csv); views, cadence, rates, --since and the format tables still read them as "
+                "listed." if lookups else "")]
             if any(p["platform"] == "youtube" for p in all_posts) else []),
           "- Posts under 3 days old are still climbing. Don't compare them with older posts.",
           *(["- TikTok photo carousels get their own group (tiktok photos): their listed length is the song's, and "
