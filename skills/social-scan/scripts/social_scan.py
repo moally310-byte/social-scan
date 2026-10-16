@@ -2240,9 +2240,10 @@ def chance_of(by_k, named, observed):
     row by how rarely a row of its size reaches the median it got (Westfall-
     Young min-p), so a big row's clear lead isn't drowned by noisy 5-post rows.
     Weekday rows are dealt whole dates, and time rows a date's posts within a
-    block, each row keeping its count of dates (a day's posts aren't
-    independent); length rows are dealt posts, each row keeping its size. A
-    fixed seed, so a re-render reads the same."""
+    block (a day's posts aren't independent), each only among dates with the
+    same number of posts, so every row keeps its count of dates and of posts;
+    length rows are dealt posts. A fixed seed, so a re-render reads the same.
+    None when the named row can't be tested: no other row has dates of its size."""
     keys = list(by_k)
     if len(keys) < 2 or named not in by_k:
         return None
@@ -2258,13 +2259,25 @@ def chance_of(by_k, named, observed):
         else:
             blocks += [(None, [q["lift"]]) for q in by_k[k]]
             counts.append(len(by_k[k]))
-    rng = random.Random(0)
+    strata = {}  # dates with the same number of posts trade places, so no row changes size
+    for i, (_, ls) in enumerate(blocks):
+        strata.setdefault(len(ls), []).append(i)
+    j_named = keys.index(named)
+    mine = set(range(sum(counts[:j_named]), sum(counts[:j_named + 1])))
+    if all(set(strata[len(blocks[i][1])]) <= mine for i in mine):
+        return None  # every date of the named row has a size no other row's dates share: nothing to deal
+    rng, cur = random.Random(0), list(blocks)
     meds = [[] for _ in keys]  # each row's median in each shuffle, None where it came out thin
     for _ in range(FORMAT_SHUFFLES):
-        rng.shuffle(blocks)
+        for idx in strata.values():
+            if len(idx) > 1:
+                vals = [blocks[i] for i in idx]
+                rng.shuffle(vals)
+                for i, v in zip(idx, vals):
+                    cur[i] = v
         at = 0
         for j, c in enumerate(counts):
-            part = blocks[at:at + c]
+            part = cur[at:at + c]
             at += c
             lifts = [x for _, ls in part for x in ls]
             ok = len(lifts) >= FORMAT_MIN_N and not (dated and len({d for d, _ in part}) < FORMAT_MIN_DAYS)
@@ -2329,8 +2342,9 @@ def formats_section(groups, all_posts, tz=None):
           f"or more. Posts under 3 days old and pinned posts are left out. Rows under {FORMAT_MIN_N} posts, and weekday "
           f"and time rows from fewer than {FORMAT_MIN_DAYS} dates, are marked thin: read them as anecdotes. Weekday and "
           f"time use each post's exact upload time in {label}" + ("" if tz else " (this computer's zone; --tz changes it)")
-          + ". **Strongest** needs a 1.5x median lift and a lead that random splits of the same posts (a date's posts "
-          "move together for weekday and time) give some row that isn't thin, at its own size, under 5% of the time. "
+          + ". **Strongest** needs a 1.5x median lift and a lead that random splits of the same posts (for weekday and "
+          "time, whole dates traded between dates with as many posts) give some row that isn't thin, at its own size, "
+          "under 5% of the time. "
           "That bar is per table, so a "
           "group with three tables names a chance lead about one time in eight. These slice one account's own posts, "
           "so a row can still win for another reason "
@@ -2403,12 +2417,15 @@ def formats_section(groups, all_posts, tz=None):
             ch = chance_of(by[k], r["bucket"], statistics.median(q["lift"] for q in by[k][r["bucket"]]))  # unrounded
             verdict[k] = {"bucket": r["bucket"], "median_lift": r["median_lift"], "chance": ch,
                           "finding": ch is not None and ch < 0.05}
-            if verdict[k]["finding"]:
+            if ch is None:
+                maybe.append(f"{k} {r['bucket']} leads at {r['median_lift']:.1f}x (n={r['n']}), but it can't be tested "
+                             f"against chance: its dates have a post count no other {some[k]}'s dates share")
+            elif verdict[k]["finding"]:
                 found.append(f"{k} {r['bucket']} ({r['median_lift']:.1f}x median lift, {r['n_2x']} of {r['n']} at 2x+)")
             else:
                 maybe.append(f"{k} {r['bucket']} leads at {r['median_lift']:.1f}x (n={r['n']}), but random splits of "
                              f"these posts give some {some[k]} a lead that unusual for its size "
-                             f"{round((ch or 0) * 100)}% of the time")
+                             + ("almost every time" if ch >= 0.995 else f"{round(ch * 100)}% of the time"))
         data["groups"][s["group"]] = {"posts": n, "timed": timed, "with_length": sized,
                                       "rebased_median_views": {"length": bases["length"] if rows["length"] else None,
                                                                "weekday_time": bases["weekday"] if rows["weekday"] else None},
