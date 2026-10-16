@@ -2,7 +2,10 @@
 """social-scan: pull public social stats and turn them into a one-page audit.
 
 Backends
-  YouTube, TikTok  -> yt-dlp, run here (logged out, no cookies)
+  YouTube, TikTok  -> yt-dlp, run here (logged out, no cookies); TikTok
+                      followers and photo carousels from the public pages
+  Snapchat         -> the public profile page (logged out, no cookies): the
+                      newest Spotlights it lists, with no logged-out paging
   Instagram        -> Apify REST (`scan --instagram` or `collect --instagram`,
                       APIFY_TOKEN from the environment) or Apify MCP dataset
                       JSON via `ingest-ig`
@@ -10,7 +13,7 @@ Backends
 Start here
   doctor     [--get-model]   what's installed, what each missing piece turns off,
                              and the install line for macOS and Linux
-  scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--name N]
+  scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--name N]
              [--tiktok-followers N] [--limit N] [--yt-enrich N] [--no-hooks] [--no-comments]
                              collect, hooks, comments and report in one go;
                              a step whose tool is missing is skipped with a note.
@@ -18,7 +21,7 @@ Start here
                              everything already in it.
 
 Single steps
-  collect    --out DIR [--youtube H] [--tiktok H] [--instagram H] [--limit N] [--yt-enrich N]
+  collect    --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--limit N] [--yt-enrich N]
   ingest-ig  --out DIR (--reels reels.json | --posts posts.json) [--profile profile.json]
   meta       --out DIR --platform P --followers N [--following N] [--source TEXT]
   hooks      --out DIR [--top N] [--bottom N] [--seconds S]
@@ -71,6 +74,11 @@ MIN_RATE_N = 10  # under this many posts with likes, engagement lift is not show
 IG_REELS_ACTOR = "apify/instagram-reel-scraper"
 IG_MAX_USD = 0.30  # hard cap per Apify call; an Instagram run makes two (about $0.11 for 40 reels)
 GAP_FLAG_DAYS = 7  # a gap this long, and 4x the usual gap, gets a "check the profile" line
+PLATFORMS = ("youtube", "tiktok", "instagram", "snapchat")
+# public pages answer a normal browser the same way they answer anyone logged out
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/129.0.0.0 Safari/537.36")
+SNAP_EARN_S = 30  # Snapchat pays only on Spotlights this long or longer (Snap help 14669003687444, checked 2026-10-16)
 
 
 # ---------- helpers ----------
@@ -93,6 +101,28 @@ def ytdlp_json(url, extra=(), flat=True, timeout=300):
         return json.loads(p.stdout)
     except ValueError:  # json.JSONDecodeError
         raise RuntimeError("yt-dlp returned unreadable output (an old yt-dlp is the usual cause; `doctor` checks its age)")
+
+
+def page_json(url, script_id, timeout=30):
+    """The JSON a public page embeds in <script id=script_id>, fetched logged out with no cookies."""
+    import http.client
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            html = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} from {url}")
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:  # incl. a cut-off read
+        raise RuntimeError(f"couldn't reach {url} ({getattr(e, 'reason', None) or type(e).__name__})")
+    m = re.search(rf'<script id="{script_id}"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        raise RuntimeError(f"{url} has no {script_id} data (blocked, changed, or not a public page)")
+    try:
+        return json.loads(m.group(1))
+    except ValueError:
+        raise RuntimeError(f"{url} sent unreadable {script_id} data")
 
 
 def to_date(entry):
@@ -224,8 +254,50 @@ def collect_youtube(handle, out, limit, enrich):
           + (f"{followers:,} subscribers" if followers is not None else "subscriber count not shown"), file=sys.stderr)
 
 
+def tiktok_profile(handle):
+    """Followers and following from the public profile page. Raises for a handle that doesn't exist."""
+    d = page_json(f"https://www.tiktok.com/@{handle}", "__UNIVERSAL_DATA_FOR_REHYDRATION__")
+    ud = (d.get("__DEFAULT_SCOPE__") or {}).get("webapp.user-detail") or {}
+    if ud.get("statusCode") == 10221:  # TikTok answers 200 either way; this code means no such account
+        raise RuntimeError(f"no TikTok account @{handle} (check the handle)")
+    ui = ud.get("userInfo") or {}
+    if ud.get("statusCode") or not ui:
+        raise RuntimeError(f"profile page status {ud.get('statusCode')}")
+    st, s2 = ui.get("stats") or {}, ui.get("statsV2") or {}
+    return {"followers": num(s2.get("followerCount") or st.get("followerCount")),
+            "following": num(s2.get("followingCount") or st.get("followingCount"))}
+
+
+def tiktok_kind(url):
+    """("photo", slide count, first slide URL) for a photo carousel, ("video", None, None), or None when the page won't say."""
+    try:
+        d = page_json(url, "__UNIVERSAL_DATA_FOR_REHYDRATION__")
+    except RuntimeError:
+        return None
+    it = (((d.get("__DEFAULT_SCOPE__") or {}).get("webapp.video-detail") or {}).get("itemInfo") or {}).get("itemStruct")
+    if not it:
+        return None
+    ip = it.get("imagePost")
+    if not ip:
+        return ("video", None, None)
+    images = ip.get("images") or []
+    try:
+        first = (((images[0] if images else {}).get("imageURL") or {}).get("urlList") or [None])[0]
+    except (AttributeError, TypeError, IndexError):
+        first = None
+    return ("photo", len(images), first)
+
+
 def collect_tiktok(handle, out, limit, quiet_followers=False):
-    d = ytdlp_json(f"https://www.tiktok.com/@{handle_of(handle)}", ["--playlist-end", str(limit)])
+    h, info = handle_of(handle), {}
+    try:  # first, so a mistyped handle fails before the listing
+        prof = tiktok_profile(h)
+    except RuntimeError as e:
+        if str(e).startswith("no TikTok account"):
+            raise
+        prof, info["followers_error"] = None, str(e)
+        print(f"  tiktok: follower count not fetched ({e})", file=sys.stderr)
+    d = ytdlp_json(f"https://www.tiktok.com/@{h}", ["--playlist-end", str(limit)])
     save(os.path.join(out, "raw", "tiktok.json"), d)
     posts = []
     for e in d.get("entries") or []:
@@ -240,10 +312,147 @@ def collect_tiktok(handle, out, limit, quiet_followers=False):
         })
     if not posts:
         print("  tiktok: 0 posts (private, empty, or blocked)", file=sys.stderr)
+    # a photo carousel's listed length is its song's, so carousels need telling
+    # apart: their cover thumbnails sit under a "photomode" CDN path (matched the
+    # post pages 19 of 19 carousels and 101 of 101 videos on two accounts,
+    # 2026-10-16). Only carousels, and posts with no thumbnail, get a page GET.
+    thumbs = {e.get("id"): " ".join(t.get("url") or "" for t in (e.get("thumbnails") or []))
+              for e in d.get("entries") or []}
+    def classify(q):
+        t = thumbs.get(q["id"]) or ""
+        if t and "photomode" not in t:
+            return ("video", None, None)
+        k = tiktok_kind(q["url"]) if q.get("url") else None
+        if k is None and "photomode" in t:  # the page didn't answer: the listing still says carousel
+            cover = next((x.get("url") for e in d.get("entries") or [] if e.get("id") == q["id"]
+                          for x in (e.get("thumbnails") or []) if "photomode" in (x.get("url") or "")), None)
+            return ("photo", None, cover)
+        return k
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        kinds = list(ex.map(classify, posts))
+    for q, k in zip(posts, kinds):
+        if k and k[0] == "photo":
+            q.update(kind="photo", slides=k[1], slide_url=k[2], duration_s=None)
+        q["kind_checked"] = k is not None
+    info["unchecked"] = unchecked = sum(1 for k in kinds if k is None)
     save(os.path.join(out, "posts_tiktok.json"), posts)
-    print(f"  tiktok: {len(posts)} posts" + ("" if quiet_followers else
-          f" (followers aren't visible logged out; add them with: python3 {here()} meta --out {shlex.quote(out)} "
-          "--platform tiktok --followers N)"), file=sys.stderr)
+    if prof and prof["followers"] is not None:
+        save(os.path.join(out, "meta_tiktok.json"), {"followers": prof["followers"], "following": prof["following"],
+                                                     "source": "tiktok.com profile page, logged out",
+                                                     "pulled": TODAY.isoformat()})
+    photos = sum(1 for q in posts if q["kind"] == "photo")
+    print(f"  tiktok: {len(posts)} posts ({photos} photo carousel{'' if photos == 1 else 's'}"
+          + (f", {unchecked} couldn't be checked and count as videos" if unchecked else "") + ")"
+          + (f", {prof['followers']:,} followers" if prof and prof["followers"] is not None else
+             "" if quiet_followers else f"; add followers with: python3 {here()} meta --out {shlex.quote(out)} "
+             "--platform tiktok --followers N"), file=sys.stderr)
+    return info
+
+
+def snap_seo_keywords(m):
+    """The keywords from Snap's SEO pass (the one that wrote llmTitle), best first; [] when absent."""
+    if m.get("llmKeywords"):
+        return list(m["llmKeywords"])[:6]
+    for sig in m.get("cuSignals") or []:
+        pr = ((sig.get("signal") or {}).get("llmPrediction") or {}).get("llmPromptResult") or {}
+        if pr.get("promptName") == "seo_description_and_keywords":
+            try:
+                raw = json.loads((((pr.get("promptResult") or {}).get("keywords") or {}).get("result") or {}).get("stringValue") or "[]")
+                pairs = [(k.rsplit("|", 1)[0], float(k.rsplit("|", 1)[1]) if "|" in k else 0) for k in raw]
+            except (ValueError, TypeError, AttributeError):
+                return []
+            return [k for k, _ in sorted(pairs, key=lambda x: -x[1])][:6]
+    return []
+
+
+def collect_snapchat(handle, out):
+    """Spotlights from the public profile page, logged out: one GET, plus one per
+    Spotlight whose view count the profile hides. Snapchat lists only the newest
+    Spotlights logged out (3 to 26 on accounts tested), with no paging."""
+    h = handle_of(handle)
+    try:
+        pp = page_json(f"https://www.snapchat.com/@{h}", "__NEXT_DATA__")["props"]["pageProps"]
+    except RuntimeError as e:
+        if "HTTP 404" in str(e):
+            raise RuntimeError(f"no public Snapchat profile @{h} (check the handle)")
+        raise
+    except (KeyError, TypeError):
+        raise RuntimeError(f"snapchat.com/@{h} didn't send profile data (changed page, or not a public profile)")
+    up = pp.get("userProfile") or {}
+    if up.get("$case") != "publicProfileInfo":  # a personal account: no public Spotlights or follower count
+        raise RuntimeError(f"@{h} isn't a Snapchat Public Profile, so there are no Spotlights to read")
+    pi = up.get("publicProfileInfo") or {}
+    posts, post_of_snap = [], {}
+    for hl, m in zip(pp.get("spotlightHighlights") or [], pp.get("spotlightStoryMetadata") or []):
+        snaps, m = hl.get("snapList") or [], m or {}
+        sid, vm = (hl.get("storyId") or {}).get("value"), m.get("videoMetadata") or {}
+        if not snaps or not sid or not vm.get("contentUrl"):
+            continue  # an empty slot: a removed or unavailable Spotlight
+        for sn in snaps:
+            post_of_snap[(sn.get("snapId") or {}).get("value") if isinstance(sn.get("snapId"), dict) else sn.get("snapId")] = sid
+        es, ms = m.get("engagementStats") or {}, int(vm.get("uploadDateMs") or 0)
+        when = dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc) if ms else None
+        text = m.get("description") or vm.get("embeddedTextCaption") or ""
+        photo = snaps[0].get("snapMediaType") == 0  # an image Spotlight: Snap gives it a stock 10 s length
+        dur_ms = None if photo else int(vm.get("durationMs") or 0) or None
+        posts.append({
+            "platform": "snapchat", "kind": "photo" if photo else "spotlight", "id": sid,
+            "url": f"https://www.snapchat.com/spotlight/{sid}",
+            "date": when.date().isoformat() if when else None, "date_approx": False,
+            "posted_at": when.isoformat() if when else None,
+            "duration_ms": dur_ms, "duration_s": round(dur_ms / 1000, 1) if dur_ms else None,
+            "views": num(es.get("viewCount")), "views_hidden": es.get("viewCount") == "-1",
+            "likes": num(es.get("boostCount")), "comments": num(es.get("commentCount")),
+            "shares": num(es.get("shareCount")), "saves": None, "recommends": num(es.get("recommendCount")),
+            "pinned": False, "caption": first_line(text), "hook_text": first_line(text, 300),
+            "has_description": bool(m.get("description")), "hashtags": m.get("hashtags") or [],
+            # Snap's SEO pass (title + keywords) and its separate content classifier often disagree
+            "snap_ai_title": m.get("llmTitle") or None, "snap_seo_keywords": snap_seo_keywords(m),
+            "snap_content_tags": m.get("textMetadataKeywords") or [],
+            "media_url": vm.get("contentUrl"),  # signed CDN link, expires
+            "slide_url": vm.get("contentUrl") if photo else None,
+            "transcript_url": None if photo else (snaps[0].get("audioTranscriptionObjectUrl") or {}).get("value"),
+        })
+    for q in posts:  # the single Spotlight page sometimes shows a count the profile hides
+        if q["views"] is None:
+            time.sleep(1)
+            try:
+                v = num((page_json(q["url"], "__NEXT_DATA__")["props"]["pageProps"].get("videoMetadata") or {}).get("viewCount"))
+            except (RuntimeError, KeyError, TypeError):
+                v = None
+            if v is not None:
+                q["views"], q["views_hidden"] = v, False
+    inline = {}
+    try:  # one JSON string, one list of top comments per Spotlight
+        groups = json.loads(pp.get("encodedSpotlightComments") or "[]")
+    except ValueError:
+        groups = []
+    for group in groups if isinstance(groups, list) else []:
+        for c in group if isinstance(group, list) else []:
+            sid, ts = post_of_snap.get(c.get("snapId")), int(c.get("replyTimestampMs") or 0)
+            if sid and c.get("replyText"):  # text, likes, date, replies: no names, ids or avatars
+                inline.setdefault(sid, []).append({
+                    "text": re.sub(r"@ ?[\w.\-]+", "@…", c["replyText"]),
+                    "likes": sum(num(r.get("reactCount")) or 0 for r in (c.get("reactCounts") or [])),
+                    "date": dt.datetime.fromtimestamp(ts / 1000, dt.timezone.utc).date().isoformat() if ts else None,
+                    "replies": num(c.get("threadedReplyCount")),
+                    # the ids are compared here and never saved
+                    "by_creator": bool(c.get("snapPosterId")) and c.get("replyPosterId") == c.get("snapPosterId")})
+    raw = {k: v for k, v in pp.items() if "comment" not in k.lower()}  # the receipt, minus commenter identities
+    save(os.path.join(out, "raw", "snapchat_profile.json"), raw)
+    save(os.path.join(out, "posts_snapchat.json"), posts)
+    if inline:
+        save(os.path.join(out, "comments_snapchat_inline.json"), inline)
+    save(os.path.join(out, "meta_snapchat.json"), {
+        "followers": num(pi.get("subscriberCount")) or None,  # "0" means the creator hides it
+        "following": None, "source": "snapchat.com profile page, logged out", "pulled": TODAY.isoformat(),
+        "spotlights_visible": len(posts), "more_exist": bool(pp.get("spotlightHighlightsCursor")),
+        "public_story_snaps": len((pp.get("story") or {}).get("snapList") or []),
+        "saved_stories": len(pp.get("curatedHighlights") or [])})
+    hidden = sum(1 for q in posts if q["views"] is None)
+    print(f"  snapchat: {len(posts)} Spotlight{'' if len(posts) == 1 else 's'} (the newest the profile page lists)"
+          + (f", {hidden} with views hidden" if hidden else "")
+          + (f", {num(pi.get('subscriberCount')):,} followers" if num(pi.get("subscriberCount")) else ""), file=sys.stderr)
 
 
 def apify_items(actor, payload, max_items, max_usd=IG_MAX_USD):
@@ -399,6 +608,12 @@ def group_stats(name, posts, meta=None):
     # baseline excludes posts under 3 days old, which are still climbing
     in_window = [p for p in viewed if not p.get("pinned")] or viewed
     settled = [p for p in in_window if not is_fresh(p)]
+    # a burst of uploads can leave nothing settled (Snapchat lists only its newest
+    # Spotlights): use them all and say the numbers will move
+    s["all_fresh"] = bool(in_window) and not settled
+    if s["all_fresh"]:
+        settled = in_window
+    s["views_hidden"] = sum(1 for p in window if p.get("views") is None and p.get("views_hidden"))
     base = settled if len(settled) >= 5 else in_window
     s["baseline_n"] = len(base)
     s["confidence"] = "low" if len(base) < 10 else "medium" if len(base) < 20 else "high"
@@ -427,6 +642,57 @@ def group_stats(name, posts, meta=None):
         s["bottom"] = sorted(settled, key=lambda p: p["views"])[:5]
         top3 = sum(sorted((p["views"] for p in in_window), reverse=True)[:3])
         s["top3_share"] = top3 / s["total_views"] if s["total_views"] else None
+    # Snapchat withholds the view counts of its weakest Spotlights, so a hidden
+    # count is ranked below every visible one instead of dropped; dropping them ran
+    # one test account's median about 2x high (2026-10-16). Hidden posts usually,
+    # but not always, have fewer likes than visible ones: hidden_not_lowest flags it.
+    hidden_all = [p for p in window if p.get("views") is None and p.get("views_hidden")]
+    if hidden_all:
+        vis_all = sorted((p for p in window if p.get("views") is not None), key=lambda p: -p["views"])
+        # posts under 3 days old stay out of the baseline, as on every other platform,
+        # unless that leaves too few (a burst of uploads)
+        old_vis = [p for p in vis_all if not is_fresh(p)]
+        old_hid = [p for p in hidden_all if not is_fresh(p)]
+        vis, hidden = (old_vis, old_hid) if len(old_vis) + len(old_hid) >= 5 and old_vis else (vis_all, hidden_all)
+        n = len(vis) + len(hidden)
+        s["baseline_n"] = n
+        s["confidence"] = "low" if n < 10 else "medium" if n < 20 else "high"
+        liked = [p for p in window if p.get("likes") is not None]
+        eng_pool = [engagement(p) for p in liked if not is_fresh(p)]
+        if len(eng_pool) < MIN_RATE_N:
+            eng_pool = [engagement(p) for p in liked]
+        eng_med = statistics.median(eng_pool) if len(eng_pool) >= MIN_RATE_N else None
+        for p in liked:
+            p["eng_lift"] = round(engagement(p) / eng_med, 2) if eng_med else None
+        s["hidden_not_lowest"] = bool(vis) and any((h.get("likes") or 0) > min((v.get("likes") or 0) for v in vis)
+                                                   for h in hidden)
+        med, under = censored_median([p["views"] for p in vis], len(hidden))
+        if med is not None:  # the median is a visible count: lift and tiers hold
+            s["median"] = med
+            for p in vis_all:  # fresh posts still get a lift in the tables, marked fresh
+                p["lift"] = round(p["views"] / med, 2) if med > 0 else None
+                p["tier"] = tier_of(p["lift"])
+            s["tiers"] = {name: sum(1 for p in vis if p["tier"] == name) for _, name in TIERS}
+            s["outliers"] = [p for p in vis_all if p["tier"]]
+            s["top"] = s["outliers"][:10] if len(s["outliers"]) > 5 else vis_all[:5]
+            s["bottom"] = (sorted(hidden, key=lambda p: p.get("likes") or 0) + vis[::-1])[:5]
+            s["top3_upper"] = True  # hidden views are missing from the total, so the share is at most this
+            s["duds"] = [p for p in vis if med > 0 and p["views"] < 0.2 * med]
+            if vis and med > 0 and vis[-1]["views"] < 0.2 * med:  # every hidden count is lower still
+                s["duds"] += hidden
+            else:
+                s["duds_unknown"] = len(hidden)
+        else:  # half or more hidden: the median is only known to be under the lowest visible count
+            s["median"], s["median_under"] = None, under
+            for p in vis_all:
+                p["lift"], p["tier"] = None, None
+            s["tiers"], s["top3_share"], s["outliers"], s["duds"] = None, None, [], []
+            s["rank_by"] = "likes"
+            old = [p for p in liked if not is_fresh(p)] or liked
+            s["top"] = sorted(liked, key=lambda p: -p["likes"])[:5]
+            s["bottom"] = sorted(old, key=lambda p: p["likes"])[:5]
+    elif not base:
+        s["tiers"] = None
     s["rate_n"] = sum(1 for p in window if p.get("likes") is not None and p.get("views"))
     s["like_rate"] = median_rate(window, "likes")
     s["comment_rate"] = median_rate(window, "comments")
@@ -434,6 +700,20 @@ def group_stats(name, posts, meta=None):
     s["fresh"] = sum(1 for p in window if is_fresh(p))
     s["pinned"] = sum(1 for p in posts if p.get("pinned"))
     return s
+
+
+def censored_median(vis, n_hidden):
+    """Median views when some counts are hidden below every visible one (Snapchat).
+    Returns (median, under): the median when it lands on a visible count, else
+    (None, lowest visible count) because it's only known to be under that."""
+    vis = sorted(vis, reverse=True)
+    n = len(vis) + n_hidden
+    if not n:
+        return None, None
+    lo, hi = (n - 1) // 2, n // 2  # the median's rank(s), highest first
+    if hi < len(vis):
+        return (vis[lo] + vis[hi]) / 2, None
+    return None, (vis[-1] if vis else None)
 
 
 def largest_gap(dates):
@@ -465,8 +745,9 @@ def tier_of(lift):
 def engagement(p):
     """Likes + comments, or None when likes are hidden or unknown.
 
-    Shares and saves stay out: only TikTok exposes them logged out, so adding
-    them would make the same number mean different things per platform.
+    Shares and saves stay out: only TikTok (shares, saves) and Snapchat (shares)
+    expose them logged out, so adding them would make the same number mean
+    different things per platform.
     """
     if p.get("likes") is None:
         return None
@@ -483,7 +764,8 @@ def followers_per_1k(posts, meta):
 # ---------- hooks and comments (run after collect / ingest-ig) ----------
 
 HOOK_WINDOW_MS = 10_000  # the spoken hook is what is said in the first 10 seconds
-JUNK = re.compile(r"thanks? (you )?for watching|subscribe|subtitles? by|amara\.org|^\W*$|^\s*[\[(].*[\])]\s*$", re.I)
+# ♪ marks sung lyrics (whisper and Snap's transcripts both use it): a song isn't a spoken hook
+JUNK = re.compile(r"thanks? (you )?for watching|subscribe|subtitles? by|amara\.org|♪|^\W*$|^\s*[\[(].*[\])]\s*$", re.I)
 
 
 def cell(text):
@@ -503,9 +785,51 @@ def pick_targets(groups, top, bottom):
     return out
 
 
+def vtt_hook(url):
+    """Snap's own transcript for a Spotlight: speech that starts in the hook window, or "" for none."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:  # served as octet-stream: read it as text
+        txt = r.read().decode("utf-8", "replace").replace("\r\n", "\n")
+    words = []
+    for h, m, sec, text in re.findall(r"(\d+):(\d\d):(\d\d)\.\d+ --> [^\n]+\n(.+?)(?:\n\n|\Z)", txt, re.S):
+        text = text.replace("\n", " ").strip()
+        if (int(h) * 3600 + int(m) * 60 + int(sec)) * 1000 < HOOK_WINDOW_MS and text and not JUNK.search(text):
+            words += text.split()
+    return " ".join(words[:40]) + (" …" if len(words) > 40 else "")
+
+
+def save_image(url, path):
+    """A photo post's image as the visual hook, scaled to 360 px when ffmpeg is there. True when saved."""
+    import http.client
+    import urllib.request
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30) as r:
+            data, ctype = r.read(), r.headers.get("Content-Type") or ""
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+    tmp = path + ".src"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        if shutil.which(FFMPEG):
+            try:
+                return subprocess.run([FFMPEG, "-v", "error", "-y", "-i", tmp, "-frames:v", "1", "-vf", "scale=360:-2",
+                                       path], capture_output=True, timeout=60).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                return False
+        if not ctype.startswith("image/"):  # an error page, not a picture
+            return False
+        os.replace(tmp, path)
+        return True
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def fetch_clip(plat, p, seconds, path):
     """First `seconds` of the post's video, logged out. Returns an error string or None."""
-    if plat == "instagram":
+    if plat in ("instagram", "snapchat"):
         if not p.get("media_url"):
             return "no video url in the scrape (photo, carousel, or an older fixture)"
         cmd = [FFMPEG, "-v", "error", "-y", "-t", str(seconds), "-i", p["media_url"], "-c", "copy", path]
@@ -518,7 +842,7 @@ def fetch_clip(plat, p, seconds, path):
         if r.returncode == 0 and os.path.exists(path):
             return None
     err = (r.stderr.strip().splitlines() or ["download failed"])[-1]
-    return ("video link expired or blocked: " if plat == "instagram" else "") + err[:160]
+    return ("video link expired or blocked: " if plat in ("instagram", "snapchat") else "") + err[:160]
 
 
 def model_problem(path):
@@ -595,11 +919,34 @@ def hooks(out, top, bottom, seconds):
     no_clips = not shutil.which(YTDLP)
     if no_speech:
         keeps = "caption openings only" if no_frames else "caption openings and first frames"
-        print(f"  hooks: {speech_off(detail=True)}, so {keeps}, no spoken hooks (`doctor` has the fix)", file=sys.stderr)
-    if no_clips and any(t[0] != "instagram" for t in targets):
-        print("  hooks: yt-dlp not installed, so YouTube and TikTok keep caption openings only", file=sys.stderr)
+        extra = [x for x, on in (("Snapchat Spotlights keep Snap's own transcript",
+                                  any(t[0] == "snapchat" and t[3].get("transcript_url") for t in targets)),
+                                 ("photo posts keep their image", any(t[3].get("slide_url") for t in targets))) if on]
+        print(f"  hooks: {speech_off(detail=True)}, so {keeps}, no whisper transcripts"
+              + (f" ({'; '.join(extra)})" if extra else "") + " (`doctor` has the fix)", file=sys.stderr)
+    # with yt-dlp gone, an earlier hooks.json row for the same post (same views) is kept, not downgraded
+    prev = {(e["platform"], e["id"]): e for e in load(os.path.join(out, "hooks.json"), []) or []}
 
-    def one(t):
+    def better(e, t):  # an earlier row for the same post (same views) wins when it has more
+        old = prev.get((e["platform"], e["id"]))
+        score = lambda x: (x.get("spoken_status") == "ok") + bool(x.get("frame"))
+        photoish = lambda x: (x.get("spoken_status") or "").startswith(("photo", "image link"))
+        if old and old.get("views") == t[3].get("views") and photoish(old) == photoish(e) and score(old) > score(e):
+            return dict(old, group=e["group"], role=e["role"], lift=e.get("lift"), tier=e.get("tier"))
+        return e
+
+    def one(t):  # one post can never sink the batch
+        try:
+            return better(_one(t), t)
+        except Exception as err:
+            plat, group, role, p = t
+            print(f"    {plat} {p['id']}: {err}", file=sys.stderr)
+            return {"platform": plat, "group": group, "role": role, "id": p["id"], "url": p["url"],
+                    "views": p.get("views"), "lift": p.get("lift"), "tier": p.get("tier"),
+                    "text_hook": caption_hook(p.get("hook_text") or p.get("caption")), "spoken_hook": None,
+                    "spoken_status": f"failed: {type(err).__name__}", "frame": None}
+
+    def _one(t):
         plat, group, role, p = t
         stem = os.path.join(hdir, f"{plat}_{p['id']}")
         e = {"platform": plat, "group": group, "role": role, "id": p["id"], "url": p["url"],
@@ -609,22 +956,52 @@ def hooks(out, top, bottom, seconds):
         if p.get("kind") in ("image", "carousel"):
             e["spoken_status"] = "photo or carousel: text hook only"
             return e
-        if no_frames:
-            e["spoken_status"] = f"skipped: {no_speech}"
+        if p.get("kind") == "photo":  # a TikTok carousel or image Spotlight: no speech, the image is the hook
+            e["spoken_status"] = "photo carousel: no speech" if plat == "tiktok" else "photo: no speech"
+            if p.get("slide_url") and save_image(p["slide_url"], stem + ".jpg"):
+                e["frame"] = os.path.relpath(stem + ".jpg", out)
+            elif p.get("slide_url"):  # counted as a failure, so the recap says the visual hook is missing
+                e["spoken_status"] = f"image link expired or blocked (re-collect {plat} to refresh it)"
             return e
-        if no_clips and plat != "instagram":
+        old = prev.get((plat, p["id"]))
+        if no_clips and plat in ("youtube", "tiktok") and old and old.get("views") == p.get("views") \
+                and (old.get("spoken_status") == "ok" or old.get("frame")):
+            return dict(old, group=group, role=role, lift=p.get("lift"), tier=p.get("tier"))
+        snap_said = None
+        if plat == "snapchat" and p.get("transcript_url"):  # Snap's own transcript beats a local guess
+            try:
+                snap_said = vtt_hook(p["transcript_url"])
+                e["spoken_source"] = "snap transcript"
+            except Exception:  # falls through to the local whisper path
+                snap_said = None
+        if no_frames:
+            if snap_said is not None:
+                e["spoken_hook"], e["spoken_status"] = snap_said, "ok" if snap_said else \
+                    "no speech found in the hook window (music, text-only, or silent open)"
+            else:
+                e["spoken_status"] = f"skipped: {no_speech}"
+            return e
+        if no_clips and plat in ("youtube", "tiktok"):
             e["spoken_status"] = "skipped: yt-dlp not installed"
             return e
         clip, wav = stem + ".mp4", stem + ".wav"
         try:
             err = fetch_clip(plat, p, seconds, clip)
             if err:
-                e["spoken_status"] = err
+                if snap_said is not None:  # the clip link expired, but Snap's transcript is already in hand
+                    e["spoken_hook"], e["spoken_status"] = snap_said, "ok" if snap_said else \
+                        "no speech found in the hook window (music, text-only, or silent open)"
+                else:
+                    e["spoken_status"] = err
                 return e
             subprocess.run([FFMPEG, "-v", "error", "-y", "-ss", "0.5", "-i", clip, "-frames:v", "1",
                             "-vf", "scale=360:-2", stem + ".jpg"], capture_output=True, timeout=60)
             if os.path.exists(stem + ".jpg"):
                 e["frame"] = os.path.relpath(stem + ".jpg", out)
+            if snap_said is not None:
+                e["spoken_hook"], e["spoken_status"] = snap_said, "ok" if snap_said else \
+                    "no speech found in the hook window (music, text-only, or silent open)"
+                return e
             if no_speech:
                 e["spoken_status"] = f"skipped: {no_speech}"
                 return e
@@ -648,11 +1025,19 @@ def hooks(out, top, bottom, seconds):
 
     with ThreadPoolExecutor(max_workers=3) as ex:
         entries = list(ex.map(one, targets))
+    if no_clips:
+        yt = [e for e in entries if e["platform"] in ("youtube", "tiktok") and
+              not (e.get("spoken_status") or "").startswith(("photo", "image link"))]
+        bare = sum(1 for e in yt if e.get("spoken_status") == "skipped: yt-dlp not installed")
+        if yt:
+            print("  hooks: yt-dlp not installed: " + "; ".join(x for x, k in (
+                (f"{len(yt) - bare} YouTube/TikTok posts kept from the earlier hooks.json", len(yt) - bare),
+                (f"{bare} keep their caption opening only", bare)) if k), file=sys.stderr)
     save(os.path.join(out, "hooks.json"), entries)
     ok = sum(1 for e in entries if e["spoken_status"] == "ok")
-    print(f"  hooks: {len(entries)} posts, {ok} spoken hooks transcribed -> hooks.json", file=sys.stderr)
+    print(f"  hooks: {len(entries)} posts, {ok} spoken hooks -> hooks.json", file=sys.stderr)
     for e in entries:
-        if e["spoken_status"] != "ok" and not (e["spoken_status"] or "").startswith("skipped: "):
+        if e["spoken_status"] != "ok" and not (e["spoken_status"] or "").startswith(("skipped: ", "photo")):
             print(f"    {e['platform']} {e['id']}: {e['spoken_status']}", file=sys.stderr)
 
 
@@ -683,23 +1068,30 @@ def hooks_section(out, all_posts):
     frames = any(e.get("frame") for e in entries)
     secs = HOOK_WINDOW_MS // 1000
     intro = "Text hook = caption or title first line, verbatim."
-    if spoken:
-        intro += (f" Spoken hook = whisper-cli (base.en) on the first {secs} seconds, machine transcript: "
-                  "check it against the video before quoting.")
+    if spoken:  # name only the sources that filled rows
+        srcs = [x for x, on in ((f"whisper-cli (base.en) on the first {secs} seconds",
+                                 any(e.get("spoken_hook") is not None and not e.get("spoken_source") for e in entries)),
+                                (f"Snapchat's own transcript (first {secs} seconds) for Spotlights",
+                                 any(e.get("spoken_hook") is not None and e.get("spoken_source") for e in entries))) if on]
+        intro += f" Spoken hook = {' or '.join(srcs)}, machine transcript: check it against the video before quoting."
     if frames:
-        intro += " Frame = the picture at 0.5 seconds, the visual hook."
+        intro += (" Frame = " + " or ".join(x for x, on in (
+            ("the picture at 0.5 seconds", any(e.get("frame") and not (e.get("spoken_status") or "").startswith("photo") for e in entries)),
+            ("a photo post's image", any(e.get("frame") and (e.get("spoken_status") or "").startswith("photo") for e in entries)))
+            if on) + ", the visual hook.")
     missing = [w for w, on in (("spoken hooks", spoken), ("first frames", frames)) if not on]
     if missing:
         intro += f" {' and '.join(missing).capitalize()} weren't pulled on this run."
     head = ["Post", "Role", "Lift", "Text hook"] + ([f"Spoken hook (first {secs} s)"] if spoken else []) \
         + (["Frame"] if frames else [])
     L = ["## Hooks: top posts vs bottom posts", intro, ""]
-    for group in dict.fromkeys(e["group"] for e in entries):
+    grp = lambda e: live[(e["platform"], e["id"])].get("group") or e["group"]  # an older hooks.json may use old names
+    for group in dict.fromkeys(grp(e) for e in entries):
         L += [f"**{group.title()}**", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
-        for e in (x for x in entries if x["group"] == group):
+        for e in (x for x in entries if grp(x) == group):
             p = live[(e["platform"], e["id"])]
             text_hook = caption_hook(p.get("hook_text")) if p.get("hook_text") else e.get("text_hook")
-            row = [f"[{fmt(p.get('views'))}]({e['url']})", e["role"], lift_txt(p), cell(text_hook)]
+            row = [f"[{fmt(p.get('views'))}]({e['url']})", e["role"], lift_txt(p), cell(text_hook) or "_(no caption)_"]
             if spoken:
                 row.append(f'"{cell(e["spoken_hook"])}"' if e.get("spoken_hook") else f"_{cell(e.get('spoken_status'))}_")
             if frames:
@@ -713,15 +1105,22 @@ def comments(out, top, max_comments):
     """Comment text for the top posts: YouTube via yt-dlp, Instagram from the posts scrape."""
     all_posts, metas, _ = load_posts(out)
     targets = [t for t in pick_targets(build_groups(all_posts, metas), top, 0) if t[0] != "tiktok"]
-    if not shutil.which(YTDLP) and any(t[0] == "youtube" for t in targets):
-        print("  comments: yt-dlp not installed, so YouTube comments are left out", file=sys.stderr)
-        targets = [t for t in targets if t[0] != "youtube"]
+    prev = {e["id"]: e for e in load(os.path.join(out, "comments.json"), []) or []
+            if e.get("platform") == "youtube" and not (e.get("source") or "").startswith("yt-dlp failed")}
+    no_ytdlp = not shutil.which(YTDLP)
+    if no_ytdlp and any(t[0] == "youtube" for t in targets):
+        print("  comments: yt-dlp not installed, so YouTube comments come from the earlier comments.json where it has "
+              "them, and are left out otherwise", file=sys.stderr)
+        targets = [t for t in targets if t[0] != "youtube" or t[3]["id"] in prev]
     inline = load(os.path.join(out, "comments_instagram_inline.json"), {})
+    snap_inline = load(os.path.join(out, "comments_snapchat_inline.json"), {})
     result = []
     for plat, group, _, p in targets:
         e = {"platform": plat, "group": group, "id": p["id"], "url": p["url"], "lift": p.get("lift"),
              "tier": p.get("tier"), "comment_count": p.get("comments"), "source": None, "comments": []}
-        if plat == "youtube":
+        if plat == "youtube" and no_ytdlp:
+            e = dict(prev[p["id"]], group=group, lift=p.get("lift"), tier=p.get("tier"))
+        elif plat == "youtube":
             try:
                 d = ytdlp_json(p["url"], ["--write-comments", "--extractor-args",
                                           f"youtube:max_comments={max_comments},all,0,0;comment_sort=top"],
@@ -735,6 +1134,9 @@ def comments(out, top, max_comments):
                                   "date": to_date(c), "reply": c.get("parent") != "root",
                                   "by_creator": bool(c.get("author_is_uploader"))}
                                  for c in d.get("comments") or [] if c.get("text")]
+        elif plat == "snapchat":
+            e["source"] = "snapchat profile page (top comments only, about 25 per Spotlight)"
+            e["comments"] = snap_inline.get(p["id"], [])
         else:
             e["source"] = "instagram posts scrape (newest comments only)"
             e["comments"] = inline.get(p["id"], [])
@@ -747,7 +1149,7 @@ def comments(out, top, max_comments):
 
 def load_posts(out, since=None):
     all_posts, metas = [], {}
-    for plat in ("youtube", "tiktok", "instagram"):
+    for plat in PLATFORMS:
         all_posts += load(os.path.join(out, f"posts_{plat}.json"), [])
         m = load(os.path.join(out, f"meta_{plat}.json"))
         if m:
@@ -762,19 +1164,25 @@ def load_posts(out, since=None):
 def build_groups(all_posts, metas):
     """Platform x format groups, each with its own median baseline and per-post lift."""
     groups = []
-    for plat in ("instagram", "tiktok", "youtube"):
+    for plat in ("instagram", "tiktok", "youtube", "snapchat"):
         ps = [p for p in all_posts if p["platform"] == plat]
         if not ps:
             continue
         # followers per 1K views is per platform (all its posts in the window),
         # shown on the platform's first row only
-        fp1k = followers_per_1k(ps, metas.get(plat))
+        # Snapchat lists a few dozen Spotlights at most, with some views hidden: too thin for a per-1K figure
+        fp1k = "n/a" if plat == "snapchat" else followers_per_1k(ps, metas.get(plat))
         if plat == "youtube":
             subs = [(label, [p for p in ps if p["kind"] == kind])
                     for kind, label in (("short", "youtube shorts"), ("long", "youtube long-form"))]
         elif plat == "instagram":
             subs = [("instagram reels", [p for p in ps if p["kind"] == "reel"]),
                     ("instagram photos/carousels", [p for p in ps if p["kind"] != "reel"])]
+        elif plat == "tiktok":
+            subs = [("tiktok videos", [p for p in ps if p["kind"] != "photo"]),
+                    ("tiktok photos", [p for p in ps if p["kind"] == "photo"])]
+        elif plat == "snapchat":
+            subs = [("snapchat spotlight", ps)]
         else:
             subs = [(plat, ps)]
         first = True
@@ -785,6 +1193,11 @@ def build_groups(all_posts, metas):
             for p in sub:
                 p["group"] = label
             g["followers_per_1k"] = fp1k if first else "n/a"
+            if plat == "tiktok":  # one feed: a stretch of carousels isn't a gap in the videos
+                g.pop("gap", None)
+                if first:
+                    whole = sorted(p["date"] for p in ps if p.get("date") and not p.get("pinned"))
+                    g["gap"] = largest_gap(whole) if len(whole) > 1 else None
             first = False
             groups.append((plat, g))
     return groups
@@ -792,7 +1205,8 @@ def build_groups(all_posts, metas):
 
 def flags(p):
     f = [x for x, on in (("approx", p.get("date") and p.get("date_approx")), ("pinned", p.get("pinned")),
-                         ("fresh", is_fresh(p))) if on]
+                         ("fresh", is_fresh(p)), ("views hidden", p.get("views") is None and p.get("views_hidden")),
+                         (f"{p.get('slides')} slides", p.get("kind") == "photo" and p.get("slides"))) if on]
     return f" ({', '.join(f)})" if f else ""
 
 
@@ -826,6 +1240,66 @@ def lift_txt(p):
     return f"{p['lift']:.1f}x" if p["lift"] >= 0.95 else f"{p['lift']:.2f}x"
 
 
+def spotlight_checks(posts, meta):
+    """Snapchat-specific checks under the Spotlight group: what can earn, how it went up, what Snap reads."""
+    n = len(posts)
+    if not n:
+        return []
+    vids = [p for p in posts if p.get("kind") != "photo"]
+    photos = n - len(vids)
+    # test the raw milliseconds: 29,970 ms rounds to 30.0 s but can't earn
+    timed = [p for p in vids if p.get("duration_ms") or p.get("duration_s")]
+    ms = lambda p: p.get("duration_ms") or round((p.get("duration_s") or 0) * 1000)
+    short = sorted(ms(p) for p in timed if ms(p) < SNAP_EARN_S * 1000)
+    secs = lambda v: f"{v / 1000:.2f}".rstrip("0").rstrip(".") + " s"
+    L = [f"**Spotlight checks** (Snapchat pays only on video Spotlights of {SNAP_EARN_S} s or more: Snap help article "
+         "14669003687444, checked 2026-10-16)",
+         f"- {SNAP_EARN_S} s or longer: {len(timed) - len(short)} of {len(timed)} videos"
+         + (f" ({len(short)} can't earn: {', '.join(secs(v) for v in short)})" if short else ".")]
+    if photos:
+        L.append(f"- Photo Spotlights: {photos} (no length, can't earn).")
+    buckets = [("under 30 s", 0, 30), ("30-59 s", 30, 60), ("60-179 s", 60, 180), ("180 s+", 180, 10 ** 6)]
+    parts = []
+    for label, lo, hi in buckets:
+        b = [p for p in timed if lo * 1000 <= ms(p) < hi * 1000]
+        if b:
+            v = [p["views"] for p in b if p.get("views") is not None]
+            nh = sum(1 for p in b if p.get("views") is None and p.get("views_hidden"))
+            bmed, bunder = censored_median(v, nh)
+            txt = ""
+            if len(b) >= 3 and (bmed is not None or bunder is not None):  # two posts aren't a comparison
+                txt = (f" (median {fmt(bmed)} views" if bmed is not None else f" (median under {fmt(bunder)} views") \
+                    + (f", {nh} of {len(b)} hidden)" if nh else ")")
+            parts.append(f"{label} {len(b)}{txt}")
+    if parts:
+        L.append("- Length: " + "; ".join(parts) + ".")
+    stamps = sorted(dt.datetime.fromisoformat(p["posted_at"]) for p in posts if p.get("posted_at"))
+    burst = sum(1 for i, t in enumerate(stamps)
+                if (i and (t - stamps[i - 1]).total_seconds() <= 120)
+                or (i + 1 < len(stamps) and (stamps[i + 1] - t).total_seconds() <= 120))
+    if burst:
+        L.append(f"- Upload bursts: {burst} of {n} went up within 2 minutes of another. Spread them out, and check "
+                 "nobody else uploads the same clips: Snapchat drops repeated content from recommendations.")
+    L.append(f"- Descriptions on {sum(1 for p in posts if p.get('has_description'))} of {n}; hashtags on "
+             f"{sum(1 for p in posts if p.get('hashtags'))} of {n} (Snap uses both to place a Spotlight).")
+    if "public_story_snaps" in meta:
+        L.append(f"- Public Story: {meta['public_story_snaps']} snaps live now; Saved Stories: "
+                 f"{meta.get('saved_stories', 0)}.")
+    if meta.get("more_exist"):
+        L.append("- The profile has more Spotlights than the page lists; older ones aren't in this scan.")
+    read = [p for p in sorted(posts, key=lambda p: -(p.get("likes") or 0)) if p.get("snap_ai_title")][:5]
+    if read:
+        L += ["", "**Snap's read of the most-liked Spotlights** (Snap's SEO pass writes the title and keywords; a "
+              "separate classifier writes the content tags, and the two often disagree. Whether either steers "
+              "recommendations isn't public.)",
+              "| Spotlight | Likes | Snap's title | Snap's keywords | Content tags |", "|---|---|---|---|---|"]
+        for p in read:
+            L.append(f"| [{p.get('date') or '?'}]({p['url']}) | {fmt(p.get('likes'))} | {cell(p['snap_ai_title'])} | "
+                     f"{cell(', '.join((p.get('snap_seo_keywords') or [])[:5]))} | "
+                     f"{cell(', '.join((p.get('snap_content_tags') or p.get('snap_keywords') or [])[:5]))} |")
+    return L
+
+
 def report(out, name, since, note=None):
     all_posts, metas, undated_dropped = load_posts(out, since)
     if not all_posts:
@@ -834,7 +1308,8 @@ def report(out, name, since, note=None):
 
     with open(os.path.join(out, "posts.csv"), "w", newline="") as f:
         cols = ["platform", "group", "kind", "date", "date_approx", "views", "lift", "tier", "eng_lift",
-                "likes", "comments", "shares", "saves", "duration_s", "pinned", "caption", "url", "id"]
+                "likes", "comments", "shares", "saves", "duration_s", "pinned", "caption", "url", "id",
+                "views_hidden", "slides", "recommends", "kind_checked"]
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for p in sorted(all_posts, key=lambda p: (p["platform"], p.get("date") or ""), reverse=True):
@@ -845,7 +1320,7 @@ def report(out, name, since, note=None):
          + (f" since {since}." if since else "."), ""]
 
     L += ["## Accounts", "| Platform | Followers | Following | Source |", "|---|---|---|---|"]
-    for plat in ("instagram", "tiktok", "youtube"):
+    for plat in ("instagram", "tiktok", "youtube", "snapchat"):
         m = metas.get(plat)
         if m:
             src = m.get("source", "") + (f", pulled {m['pulled']}" if m.get("pulled") else "")
@@ -859,8 +1334,10 @@ def report(out, name, since, note=None):
         rn = f" ({s['rate_n']})" if s["like_rate"] is not None else ""
         t = s.get("tiers")
         tiers = f"{t['huge']} / {t['strong']} / {t['mild']}" if t else "n/a"
-        L.append(f"| {s['group']} | {s['posts']} | {per_week_txt(s)} | {fmt(s.get('median'))} | "
-                 f"{fmt(s.get('max'))} | {pct(s.get('top3_share'))} | {tiers} | {s['confidence']} ({s['baseline_n']}) | "
+        med = f"under {fmt(s['median_under'])}" if s.get("median_under") is not None else fmt(s.get("median"))
+        t3 = ("≤" if s.get("top3_upper") and s.get("top3_share") is not None else "") + pct(s.get("top3_share"))
+        L.append(f"| {s['group']} | {s['posts']} | {per_week_txt(s)} | {med} | "
+                 f"{fmt(s.get('max'))} | {t3} | {tiers} | {s['confidence']} ({s['baseline_n']}) | "
                  f"{pct(s['like_rate'])}{rn} | {pct(s['comment_rate'])} | {s.get('followers_per_1k') or 'n/a'} |")
     if undated_dropped:
         L.append(f"\n{undated_dropped} undated posts left out by --since (un-enriched YouTube Shorts).")
@@ -873,13 +1350,43 @@ def report(out, name, since, note=None):
     for _, s in groups:
         if not s.get("top"):
             continue
-        t = s["tiers"]
+        t = s.get("tiers")
+        med = f"under {fmt(s['median_under'])}" if s.get("median_under") is not None else fmt(s.get("median"))
+        duds = f"{len(s.get('duds') or [])} under 0.2x" + (
+            f", {s['duds_unknown']} hidden counts unknown" if s.get("duds_unknown") else "")
         L += [f"## {s['group'].title()}",
-              f"{window_txt(s)}. Baseline: median {fmt(s.get('median'))} views "
-              f"across {s['baseline_n']} posts, confidence {s['confidence']}. Outliers: {t['huge']} at 5x+, "
-              f"{t['strong']} at 2-5x, {t['mild']} at 1.5-2x; {len(s['duds'])} under 0.2x."]
-        if s["fresh"]:
+              f"{window_txt(s)}. Baseline: median {med} views across {s['baseline_n']} posts, confidence "
+              f"{s['confidence']}. " + (f"Outliers: {t['huge']} at 5x+, {t['strong']} at 2-5x, {t['mild']} at 1.5-2x; "
+                                        f"{duds}." if t else
+                                        "Outliers can't be measured: half or more of the view counts are hidden.")]
+        if s.get("all_fresh"):
+            L.append((f"All {s['posts']} posts are" if s["fresh"] == s["posts"] else
+                      f"Every post with a view count ({s['with_views']}) is") + " under 3 days old, so the median "
+                     + ("and tiers use" if t else "uses") + " them all: every number here will still move.")
+        elif s["fresh"] and s.get("rank_by") == "likes":
+            L.append(f"{s['fresh']} posts are under 3 days old and stay out of the bottom 5.")
+        elif s["fresh"]:
             L.append(f"{s['fresh']} posts are under 3 days old and still collecting views; they show a lift but stay out of the tier counts.")
+        if s.get("views_hidden"):
+            L.append(f"**Views hidden:** Snapchat shows view counts on {s['posts'] - s['views_hidden']} of {s['posts']} "
+                     "Spotlights and hides them on its weakest ones, so the hidden counts rank below every visible one. "
+                     + ("With half or more hidden, the median is only known to be under the lowest visible count, lift "
+                        "and tiers are left out, and the tables rank by likes." if s.get("rank_by") == "likes" else
+                        "The median counts them that way; top 3 share is an upper bound.")
+                     + (" One or more hidden Spotlights has more likes than a visible one, so treat the order as "
+                        "approximate." if s.get("hidden_not_lowest") else ""))
+        mine = [p for p in all_posts if p["platform"] == "tiktok" and p.get("group") == s["group"]]
+        unchecked = sum(1 for p in mine if p.get("kind_checked") is False)
+        legacy = sum(1 for p in mine if "kind_checked" not in p)
+        for k, why in ((unchecked, "couldn't be checked for photo carousels (the listing had no cover image and the "
+                                   "post page didn't answer)"),
+                       (legacy, "were collected before 1.2.0, so photo carousels weren't separated")):
+            if k:
+                msg = (f"{k} TikTok post{'' if k == 1 else 's'} {why} and count as videos; re-collect TikTok before "
+                       "quoting this median.")
+                L.append(msg)
+                if note:
+                    note("tiktok: " + msg)
         if s["pinned"]:
             L.append(f"{s['pinned']} pinned posts are listed for reference but sit outside the window: they stay out of "
                      "the dates, cadence, median and tier counts. Pinning keeps them in front of visitors, which explains part of their lift.")
@@ -895,17 +1402,21 @@ def report(out, name, since, note=None):
                if p["platform"] == "instagram" and p.get("group") == s["group"]):
             L.append("**Unreliable sample:** this came from the Instagram posts feed, which skips posts past the first 12 "
                      "when logged out. Re-run with the reels scrape before quoting it.")
-        L += ["", "**Top posts** (lift = views / this group's median)",
+        L += ["", "**Top posts** (" + ("ranked by likes; " if s.get("rank_by") == "likes" else "")
+              + "lift = views / this group's median)",
               "| Date | Views | Lift | Tier | Eng. lift (likes+comments) | Likes | Opening line |",
               "|---|---|---|---|---|---|---|"]
         for p in s["top"]:
             el = f"{p['eng_lift']:.1f}x" if p.get("eng_lift") is not None else "n/a"
             L.append(f"| {p.get('date') or '?'}{flags(p)} | [{fmt(p['views'])}]({p['url']}) | {lift_txt(p)} | "
-                     f"{p.get('tier') or ''} | {el} | {fmt(p.get('likes'))} | {p['caption']} |")
-        L += ["", "**Bottom 5**", "| Date | Views | Lift | Likes | Opening line |", "|---|---|---|---|---|"]
+                     f"{p.get('tier') or ''} | {el} | {fmt(p.get('likes'))} | {p['caption'] or '_(no caption)_'} |")
+        L += ["", "**Bottom 5**" + (" (by likes)" if s.get("rank_by") == "likes" else ""),
+              "| Date | Views | Lift | Likes | Opening line |", "|---|---|---|---|---|"]
         for p in s["bottom"]:
             L.append(f"| {p.get('date') or '?'}{flags(p)} | [{fmt(p['views'])}]({p['url']}) | {lift_txt(p)} | "
-                     f"{fmt(p.get('likes'))} | {p['caption']} |")
+                     f"{fmt(p.get('likes'))} | {p['caption'] or '_(no caption)_'} |")
+        if s["group"] == "snapchat spotlight":
+            L += [""] + spotlight_checks([p for p in all_posts if p["platform"] == "snapchat"], metas.get("snapchat") or {})
         L.append("")
 
     if hooks_stale(out):
@@ -930,11 +1441,19 @@ def report(out, name, since, note=None):
           "only show up in the account's own analytics.",
           "- Top 3 share is the three biggest posts' share of all views. A high number means the account "
           "lives on a few hits, not a repeatable format.",
-          "- Median views leave out posts under 3 days old. Like rate (n) shows how many posts had like counts.",
+          "- Median views leave out posts under 3 days old, unless a group has no older posts with views (the group "
+          "says so). Like rate (n) shows how many posts had like counts.",
           "- YouTube dates from flat listings are approximate unless enriched (date_approx in posts.csv and "
           "summary.json, approx in the tables): YouTube only says \"3 months ago\", so the real upload can be months "
           "earlier. Per week and the gap check use exact dates only. Shorts without enrichment have no date.",
           "- Posts under 3 days old are still climbing. Don't compare them with older posts.",
+          *(["- TikTok photo carousels get their own group (tiktok photos): their listed length is the song's, and "
+             "they have no spoken hook. Reports before 1.2.0 counted them in the tiktok row."]
+            if any(p["platform"] == "tiktok" and p.get("kind") == "photo" for p in all_posts) else []),
+          *([f"- Snapchat listed {(metas.get('snapchat') or {}).get('spotlights_visible', '?')} Spotlights logged out: "
+             "only the newest the profile page shows, with no paging, and it hides view counts on its weakest ones. "
+             "Saves, watch time, completion and earnings need the account's own Insights."]
+            if any(p["platform"] == "snapchat" for p in all_posts) else []),
           "- Instagram comes from the reels tab, the only feed that returns the newest posts in order when logged out. "
           "Photos and carousels aren't sampled. Pinned posts are shown but kept out of every window figure "
           "(reports before 2026-10-15 counted them in the median).",
@@ -980,7 +1499,7 @@ BREW_FORMULA = {"python": "python", "yt-dlp": "yt-dlp", "ffmpeg": "ffmpeg", "whi
 DISABLES = {
     "python": "everything",
     "yt-dlp": "YouTube and TikTok (required for both)",
-    "ffmpeg": "first-frame images and spoken hooks",
+    "ffmpeg": "first-frame images and spoken hooks (Snapchat keeps Snap's transcript, photo posts their image)",
     "whisper-cli": "spoken hooks (the first 10 seconds of speech)",
     "whisper model": "spoken hooks (the first 10 seconds of speech)",
     "deno": "full YouTube support (yt-dlp works without it for now, but warns that some formats may be missing)",
@@ -1117,6 +1636,7 @@ def doctor(get_model_too):
         print("Hooks: caption's first line and first frame; no spoken hook.")
     else:
         print("Hooks: caption's first line only; no first frame, no spoken hook.")
+    print("Snapchat: ready (free, logged out; the newest Spotlights the profile page lists).")
     print("Instagram: " + (f"ready (paid per use through Apify: about $0.11 per 40 reels, capped at ${IG_MAX_USD:.2f} per call)."
                            if "APIFY_TOKEN" in ok else
                            "off (optional; paid per use through Apify, about $0.11 per 40 reels; set APIFY_TOKEN to turn it on)."))
@@ -1194,17 +1714,19 @@ def get_model(path):
 def scan(a):
     """collect, hooks, comments and report in one go. A step whose tool or
     token is missing is skipped with a one-line note instead of failing."""
-    t0, notes, ran = time.time(), [], []
+    t0, notes, ran, followers_error = time.time(), [], [], None
 
     def note(msg):  # collected for the recap at the end, so each one prints once
         notes.append(msg)
 
-    todo = [(p, h) for p, h in (("youtube", a.youtube), ("tiktok", a.tiktok), ("instagram", a.instagram)) if h]
+    todo = [(p, h) for p, h in (("youtube", a.youtube), ("tiktok", a.tiktok), ("instagram", a.instagram),
+                                ("snapchat", a.snapchat)) if h]
     if not todo and not load_posts(a.out)[0]:
-        sys.exit("scan needs --youtube, --tiktok or --instagram (or an --out folder that already holds collected posts)")
+        sys.exit("scan needs --youtube, --tiktok, --instagram or --snapchat (or an --out folder that already holds "
+                 "collected posts)")
     rp = os.path.join(a.out, "raw", "instagram_reels.json")
     for plat, h in todo:
-        if plat != "instagram" and not shutil.which(YTDLP):
+        if plat in ("youtube", "tiktok") and not shutil.which(YTDLP):
             note(f"{plat} skipped: yt-dlp isn't installed (`doctor` has the install line)")
             continue
         if plat == "instagram" and not os.environ.get("APIFY_TOKEN", "").strip():
@@ -1216,7 +1738,10 @@ def scan(a):
             if plat == "youtube":
                 collect_youtube(h, a.out, a.limit, a.yt_enrich)
             elif plat == "tiktok":
-                collect_tiktok(h, a.out, a.limit, quiet_followers=True)  # the recap prints the follow-up
+                info = collect_tiktok(h, a.out, a.limit, quiet_followers=True) or {}  # the recap prints the follow-up
+                followers_error = info.get("followers_error")
+            elif plat == "snapchat":
+                collect_snapchat(h, a.out)
             else:
                 print(f"  instagram: Apify reels scrape, about $0.11 per 40 reels, capped at ${IG_MAX_USD:.2f} per call",
                       file=sys.stderr)
@@ -1230,12 +1755,14 @@ def scan(a):
                         f"python3 {here()} ingest-ig --out {shlex.quote(a.out)} --reels {shlex.quote(rp)}, "
                         f"then: python3 {here()} scan --out {shlex.quote(a.out)}")
             note(msg)
-    if a.tiktok_followers is not None:
-        save(os.path.join(a.out, "meta_tiktok.json"), {"followers": a.tiktok_followers, "following": None,
-                                                       "source": "tiktok profile page (scan --tiktok-followers)",
-                                                       "pulled": TODAY.isoformat()})
+    if a.tiktok_followers is not None:  # keep the following count this run just read
+        mp = os.path.join(a.out, "meta_tiktok.json")
+        old = load(mp) or {}
+        fresh = os.path.exists(mp) and os.path.getmtime(mp) >= t0
+        save(mp, {"followers": a.tiktok_followers, "following": old.get("following") if fresh else None,
+                  "source": "tiktok profile page (scan --tiktok-followers)", "pulled": TODAY.isoformat()})
     if todo:  # anything this run didn't refresh came from an earlier run: say so
-        for plat in ("youtube", "tiktok", "instagram"):
+        for plat in PLATFORMS:
             f = os.path.join(a.out, f"posts_{plat}.json")
             if not (os.path.exists(f) and os.path.getmtime(f) < t0):
                 continue
@@ -1257,17 +1784,25 @@ def scan(a):
     if not posts:
         for n in notes:
             print(f"  - {n}", file=sys.stderr)
+        failed = [n for n in notes if " failed: " in n]
         if not ran:
             hint = "The notes above say what was skipped; `doctor` shows what's missing."
-        elif [p for p in ran if p != "instagram"]:
-            hint = ("Check the errors above: usually a mistyped handle or a private account. If the handles are right, "
-                    "update yt-dlp (`doctor` checks its age).")
-        else:
-            hint = ("Check the Instagram error above: 401 means APIFY_TOKEN is wrong, 402 means the Apify account is out "
-                    "of credit; otherwise check the username.")
+        elif failed and all("(check the handle)" in n for n in failed):
+            hint = "Fix the handles above and run it again."
+        else:  # advice for each platform that ran
+            parts = []
+            if {"youtube", "tiktok"} & set(ran):
+                parts.append("YouTube/TikTok: usually a mistyped handle or a private account; if the handles are right, "
+                             "update yt-dlp (`doctor` checks its age).")
+            if "snapchat" in ran:
+                parts.append("Snapchat: check the network, and that the account is a Public Profile with Spotlights.")
+            if "instagram" in ran:
+                parts.append("Instagram: 401 means APIFY_TOKEN is wrong, 402 means the Apify account is out of credit; "
+                             "otherwise check the username.")
+            hint = "Check the errors above. " + " ".join(parts)
         sys.exit("Nothing was collected, so there's no report. " + hint)
     if not a.no_hooks:
-        if not shutil.which(YTDLP) and not any(p["platform"] == "instagram" for p in posts):
+        if not shutil.which(YTDLP) and not any(p["platform"] in ("instagram", "snapchat") for p in posts):
             note("hooks skipped: yt-dlp isn't installed, so any earlier hooks.json is kept")
         else:
             try:
@@ -1288,7 +1823,7 @@ def scan(a):
                          + (f"; {len(failed)} clip{'' if len(failed) == 1 else 's'} failed (first: {failed[0]['spoken_status'][:100]})"
                             if failed else "") + " (`doctor` has the fixes)")
     if not a.no_comments:
-        if not shutil.which(YTDLP) and not any(p["platform"] == "instagram" for p in posts):
+        if not shutil.which(YTDLP) and not any(p["platform"] in ("instagram", "snapchat") for p in posts):
             note("comments skipped: yt-dlp isn't installed")
         else:
             try:
@@ -1301,22 +1836,28 @@ def scan(a):
                 if bad:
                     note(f"comments: {len(bad)} of {len(cs)} posts didn't load (first: {bad[0]['source'][:120]})")
                 if not shutil.which(YTDLP) and any(p["platform"] == "youtube" for p in posts):
-                    note("comments: YouTube left out because yt-dlp isn't installed")
+                    kept = sum(1 for c in cs if c.get("platform") == "youtube")
+                    note("comments: yt-dlp isn't installed, so YouTube comments are "
+                         + (f"the earlier ones ({kept} posts)" if kept else "left out"))
     prev = load(os.path.join(a.out, "summary.json"), {}) or {}
     name = a.name or (handle_of(todo[0][1]) if todo else None) or prev.get("name")
     path = report(a.out, name, None, note=note)
 
     print(f"\nscan finished in {time.time() - t0:.0f} s", file=sys.stderr)
-    for plat in ("youtube", "tiktok", "instagram"):
+    for plat in PLATFORMS:
         n = sum(1 for p in posts if p["platform"] == plat)
         if n:
             f = (metas.get(plat) or {}).get("followers")
             who = "subscribers" if plat == "youtube" else "followers"
             print(f"  {plat:<10} {n} posts" + (f", {fmt(f)} {who}" if f is not None else ""), file=sys.stderr)
     if any(p["platform"] == "tiktok" for p in posts) and "tiktok" not in metas:
-        print("  tiktok followers aren't visible logged out. Read them off the profile page, then add them with:\n"
+        print("  tiktok: no follower count this run (the public profile page didn't give one"
+              + (f": {followers_error}" if followers_error else "") + "). Re-run later, or read it off the profile and "
+              "add it with:\n"
               f"    python3 {here()} scan --out {shlex.quote(a.out)} --tiktok-followers N --no-hooks --no-comments",
               file=sys.stderr)
+    if followers_error and "tiktok" in metas:  # the recap line above didn't print: say it here
+        notes.append(f"tiktok: no follower count this run ({followers_error}); the count shown is from an earlier run")
     if notes:
         print("Notes:", file=sys.stderr)
         for n in notes:
@@ -1344,8 +1885,9 @@ def main():
     s.add_argument("--youtube")
     s.add_argument("--tiktok")
     s.add_argument("--instagram", help="needs APIFY_TOKEN in the environment; skipped with a note when it isn't set")
+    s.add_argument("--snapchat", help="public profile, free and logged out; only the newest Spotlights the profile page lists")
     s.add_argument("--name", help="report title (default: the first handle)")
-    s.add_argument("--tiktok-followers", type=int, help="follower count read off the TikTok profile (yt-dlp can't see it)")
+    s.add_argument("--tiktok-followers", type=int, help="override the TikTok follower count scan reads off the profile page")
     s.add_argument("--limit", type=int, default=60, help="posts per tab/profile (default 60; Instagram max 50)")
     s.add_argument("--yt-enrich", type=int, default=45,
                    help="fetch likes/comments/exact dates for the newest N YouTube uploads (default 45, 0 = off)")
@@ -1357,6 +1899,7 @@ def main():
     c.add_argument("--youtube")
     c.add_argument("--tiktok")
     c.add_argument("--instagram", help="needs APIFY_TOKEN in the environment; reels tab, about $0.11 per 40 reels, capped at $0.30 per Apify call (two calls)")
+    c.add_argument("--snapchat", help="public profile, free and logged out; the newest Spotlights the profile page lists")
     c.add_argument("--limit", type=int, default=60, help="posts per tab/profile (default 60)")
     c.add_argument("--yt-enrich", type=int, default=45,
                    help="fetch likes/comments/exact dates for the newest N YouTube uploads (default 45, 0 = off)")
@@ -1370,7 +1913,7 @@ def main():
 
     m = sub.add_parser("meta", help="record a follower count by hand")
     m.add_argument("--out", required=True)
-    m.add_argument("--platform", required=True, choices=["instagram", "tiktok", "youtube"])
+    m.add_argument("--platform", required=True, choices=["instagram", "tiktok", "youtube", "snapchat"])
     m.add_argument("--followers", type=int, required=True)
     m.add_argument("--following", type=int)
     m.add_argument("--source", default="manual")
@@ -1381,7 +1924,7 @@ def main():
     h.add_argument("--bottom", type=int, default=2, help="bottom posts per group, for contrast (default 2)")
     h.add_argument("--seconds", type=int, default=20, help="seconds of video to fetch per post (default 20)")
 
-    k = sub.add_parser("comments", help="comment text for the top posts (YouTube, Instagram)")
+    k = sub.add_parser("comments", help="comment text for the top posts (YouTube, Instagram, Snapchat)")
     k.add_argument("--out", required=True)
     k.add_argument("--top", type=int, default=3, help="top posts per group (default 3)")
     k.add_argument("--max", type=int, default=100, help="YouTube comments per post (default 100)")
@@ -1398,11 +1941,12 @@ def main():
     if a.cmd == "scan":
         scan(a)
     elif a.cmd == "collect":
-        if not (a.youtube or a.tiktok or a.instagram):
-            sys.exit("collect needs at least one of --youtube, --tiktok, --instagram")
+        if not (a.youtube or a.tiktok or a.instagram or a.snapchat):
+            sys.exit("collect needs at least one of --youtube, --tiktok, --instagram, --snapchat")
         for flag, fn in ((a.youtube, lambda: collect_youtube(a.youtube, a.out, a.limit, a.yt_enrich)),
                          (a.tiktok, lambda: collect_tiktok(a.tiktok, a.out, a.limit)),
-                         (a.instagram, lambda: collect_instagram(a.instagram, a.out, min(a.limit, 50)))):
+                         (a.instagram, lambda: collect_instagram(a.instagram, a.out, min(a.limit, 50))),
+                         (a.snapchat, lambda: collect_snapchat(a.snapchat, a.out))):
             if not flag:
                 continue
             try:  # one platform failing shouldn't sink the others
@@ -1411,9 +1955,13 @@ def main():
                 print(f"  FAILED: {redact(e)}", file=sys.stderr)
     elif a.cmd == "ingest-ig":
         ingest_ig(a.reels or a.posts, a.profile, a.out, feed="reels" if a.reels else "posts")
-    elif a.cmd == "meta":
-        save(os.path.join(a.out, f"meta_{a.platform}.json"),
-             {"followers": a.followers, "following": a.following, "source": a.source, "pulled": TODAY.isoformat()})
+    elif a.cmd == "meta":  # merge, so a collector's extra fields (Snapchat's Story counts) survive
+        mp = os.path.join(a.out, f"meta_{a.platform}.json")
+        m = load(mp, {}) or {}
+        m.update(followers=a.followers, source=a.source, pulled=TODAY.isoformat())
+        if a.following is not None:
+            m["following"] = a.following
+        save(mp, m)
     elif a.cmd == "hooks":
         hooks(a.out, a.top, a.bottom, a.seconds)
         print("  run `report` to add the Hooks section to summary.md", file=sys.stderr)
