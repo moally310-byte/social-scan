@@ -19,7 +19,7 @@ Start here
                              and the install line for macOS and Linux
   scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--name N] [--prev DIR]
              [--tiktok-followers N] [--limit N | --days N] [--yt-enrich N] [--no-hooks] [--no-comments]
-             [--tiktok-comments] [--tz ZONE] [--no-prev]
+             [--tiktok-comments] [--tz ZONE] [--html [--own-account]] [--no-prev]
                              collect, hooks, comments and report in one go;
                              a step whose tool is missing is skipped with a note.
                              Use one dated --out folder per account and run
@@ -33,7 +33,7 @@ Single steps
   meta       --out DIR --platform P --followers N [--following N] [--source TEXT]
   hooks      --out DIR [--top N] [--bottom N] [--seconds S]
   comments   --out DIR [--top N] [--max N] [--tiktok-comments]
-  report     --out DIR [--name NAME] [--since YYYY-MM-DD] [--tz ZONE] [--prev DIR | --no-prev]
+  report     --out DIR [--name NAME] [--since YYYY-MM-DD] [--tz ZONE] [--html [--own-account]] [--prev DIR | --no-prev]
   diff       OLD NEW         what changed between two scan folders of one account
   compare    DIR DIR ... [--out FILE]   one table across accounts, one scan folder each
 
@@ -45,11 +45,14 @@ Tools come from PATH; YTDLP, FFMPEG, WHISPER_CLI and WHISPER_MODEL override them
 Everything is read-only. Never add --cookies or --cookies-from-browser.
 """
 import argparse
+import base64
 import bisect
 import contextlib
 import csv
 import datetime as dt
+import html
 import json
+import math
 import os
 import random
 import re
@@ -904,8 +907,9 @@ def podcast_section(out):
     except (KeyError, TypeError, ValueError):
         pulled = None
     L = ["## Podcast",
-         f"**[{pod['name']}]({pod['apple_url']})**" + (f" by {pod['publisher']}" if pod.get("publisher") else "")
-         + (f" ({', '.join(g for g in pod.get('genres') or [] if g)})" if pod.get("genres") else "")
+         f"**[{md_plain(pod['name']).replace('[', '(').replace(']', ')')}]({pod['apple_url']})**"
+         + (f" by {md_plain(pod['publisher'])}" if pod.get("publisher") else "")
+         + (f" ({', '.join(md_plain(g) for g in pod.get('genres') or [] if g)})" if pod.get("genres") else "")
          + (f": rated {pod['rating']} from {pod['ratings']:,} US rating{'' if pod['ratings'] == 1 else 's'} on Apple Podcasts"
             if pod.get("rating") and pod.get("ratings")
             else ": no ratings yet on Apple Podcasts (US store)" if pod.get("ratings") == 0 else "")
@@ -920,7 +924,7 @@ def podcast_section(out):
     also = pod.get("also_named") or []
     if also:
         L.append(f"{len(also) + 1} shows on Apple share this name; this is Apple ID {pod['apple_id']}. Others: "
-                 + ", ".join(f"{a['apple_id']} by {a.get('publisher') or '?'}" for a in also)
+                 + ", ".join(f"{a['apple_id']} by {md_plain(a.get('publisher')) or '?'}" for a in also)
                  + ". Check it's the right show; Spotify ranks are matched by name, so they could belong to another.")
     elif str(pod.get("matched_by", "")).startswith("search"):
         L.append(f"Matched by search for \"{pod['query']}\": check it's the right show (Apple ID {pod['apple_id']}).")
@@ -1430,8 +1434,18 @@ HOOK_WINDOW_MS = 10_000  # the spoken hook is what is said in the first 10 secon
 JUNK = re.compile(r"thanks? (you )?for watching|subscribe|subtitles? by|amara\.org|♪|^\W*$|^\s*[\[(].*[\])]\s*$", re.I)
 
 
+def md_plain(text):
+    """Someone else's text (a caption, a show's name) made unable to carry a
+    disguised link into summary.md or report.html: markdown link syntax is
+    broken and a "<" that could open an HTML tag is escaped. (A bare URL can
+    still autolink in some markdown viewers.)"""
+    return re.sub(r"<(?=[A-Za-z/!?])", r"\\<", str(text or "").replace("](", "] ("))
+
+
 def cell(text):
-    return (text or "").replace("|", "/").replace("\n", " ").strip()
+    """Scraped text made safe for one markdown table cell: no pipes, no line
+    breaks, no link syntax."""
+    return md_plain(text).replace("|", "/").replace("\n", " ").strip()
 
 
 def pick_targets(groups, top, bottom):
@@ -2391,6 +2405,7 @@ def formats_section(groups, all_posts, tz=None):
             lead += (" Tables that cover only some of these posts measure lift against those posts' own median views ("
                      + "; ".join(rebased) + "), not against posts they leave out, which have had longer to collect views.")
         L += [lead, ""]
+        mark = len(L)
         shown = {}
         for k in ("length", "weekday", "time"):
             if len(rows[k]) < 2:  # one bucket isn't a comparison
@@ -2492,6 +2507,8 @@ def formats_section(groups, all_posts, tz=None):
                          f"{'is' if len(same) == 1 else 'are'} {lb['bucket']}, the leading length; without "
                          f"{'it' if len(same) == 1 else 'them'} its median lift is {m:.2f}x "
                          f"(n={rest_n}{', thin' if rest_n < FORMAT_MIN_N else ''}).")
+        data["groups"][s["group"]].update(lead=lead, notes=[x for x in L[mark:] if x.startswith("**")],
+                                          lines=[x for x in L[mark:] if x and not x.startswith(("|", "**"))])
         L.append("")
     return L, data
 
@@ -2519,6 +2536,379 @@ def backfill_times(out, posts):
           if isinstance(e, dict)}
     for p in need:
         p["posted_at"] = utc_iso(ts.get(p.get("id")))
+
+
+# ---------- one-page HTML report (report --html) ----------
+
+HTML_CSS = """
+:root{color-scheme:light;--bg:#fcfcfb;--panel:#f2f1ee;--ink:#141413;--ink2:#55544f;--muted:#878680;--grid:#e3e2de;
+--accent:#2563c4;--accent-soft:#d9e6fa;--warn:#a5600b}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#191918;--panel:#242422;
+--ink:#f0efec;--ink2:#c4c3bb;--muted:#6d6c66;--grid:#34342f;--accent:#5a9bf0;--accent-soft:#1f3557;--warn:#e0a24a}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#191918;--panel:#242422;--ink:#f0efec;--ink2:#c4c3bb;--muted:#6d6c66;
+--grid:#34342f;--accent:#5a9bf0;--accent-soft:#1f3557;--warn:#e0a24a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:980px;margin:0 auto;padding:24px 16px 48px}h1{font-size:26px;line-height:1.2;margin:0 0 6px}
+h2{font-size:20px;margin:36px 0 8px;padding-top:8px;border-top:1px solid var(--grid)}h3{font-size:16px;margin:22px 0 6px}
+p{margin:6px 0}.sub,.note{color:var(--ink2)}.note{font-size:13px}a{color:var(--accent)}
+.tiles{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0}.tile{background:var(--panel);border-radius:10px;padding:10px 14px;min-width:150px;flex:1 1 150px}
+.tile b{display:block;font-size:22px;font-variant-numeric:tabular-nums}.tile span{color:var(--ink2);font-size:13px}
+.tw{overflow-x:auto;margin:8px 0}table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--grid);vertical-align:top}th{color:var(--ink2);font-weight:600;white-space:nowrap}
+td:first-child{white-space:nowrap}
+svg{display:block;width:100%;height:auto;overflow:visible}svg text{fill:var(--ink2);font-size:11px}
+.gl{stroke:var(--grid);stroke-width:1}.med{stroke:var(--ink2);stroke-dasharray:5 4;stroke-width:1.5}
+.medl{paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round;font-weight:600}
+.chart{overflow-x:auto;margin:6px 0}.pt{cursor:pointer;outline:none}.pt .zone{fill:transparent}
+.pt .dot{fill:var(--muted);stroke:var(--bg);stroke-width:1.5}.pt.hit .dot{fill:var(--accent)}
+.pt.fresh .dot{fill:var(--bg);stroke:var(--muted)}.pt:focus .dot,.pt:hover .dot{stroke:var(--ink);stroke-width:2.5}
+.legend{font-size:13px;color:var(--ink2)}.sw{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:-1px;margin:0 4px 0 10px}
+.bars{display:grid;grid-template-columns:minmax(84px,auto) 1fr auto;gap:4px 10px;align-items:center;font-size:13px;margin:6px 0 12px}
+.bar{height:14px;background:var(--panel);border-radius:3px;position:relative}.bar i{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:var(--muted)}
+.bar i.lead{background:var(--accent)}.bar.thin i{background:repeating-linear-gradient(45deg,var(--muted) 0 4px,transparent 4px 7px)}
+.bar b{position:absolute;top:-3px;bottom:-3px;width:0;border-left:1px dashed var(--ink2)}.num{font-variant-numeric:tabular-nums;color:var(--ink2);white-space:nowrap}
+.hooks{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.hook{background:var(--panel);border-radius:10px;padding:10px;font-size:13px}
+.hook img{width:100%;border-radius:6px;display:block;margin-bottom:6px}.tag{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink2)}
+.warn{color:var(--warn)}#tip{position:absolute;z-index:9;max-width:300px;background:var(--ink);color:var(--bg);border-radius:8px;padding:8px 10px;font-size:13px;box-shadow:0 4px 18px rgba(0,0,0,.25)}
+#tip a{color:var(--accent-soft);display:inline-block;margin-top:4px}
+@media (max-width:560px){h1{font-size:22px}.tile{min-width:130px}th,td{padding:5px 6px}.chart svg{min-width:600px}
+.chart svg text{font-size:15px}.bars{grid-template-columns:minmax(64px,auto) 1fr}.bars .num{grid-column:2;margin:-2px 0 6px}}
+@media print{#tip{display:none}h2{break-before:auto}th{white-space:normal}.tw,.chart{overflow:visible}
+tr,.bars,.hook{break-inside:avoid}.bar,.bar i,.sw{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+"""
+
+HTML_JS = r"""
+(function(){var tip=document.getElementById('tip'),cur=null,pinned=false;
+function place(el){var r=el.getBoundingClientRect(),w=tip.offsetWidth,h=tip.offsetHeight,vw=document.documentElement.clientWidth;
+var x=Math.max(8,Math.min(r.left+r.width/2-w/2,vw-w-8)),y=r.top-h-10;if(y<8)y=r.bottom+10;
+tip.style.left=(x+window.scrollX)+'px';tip.style.top=(y+window.scrollY)+'px';}
+function show(el,pin){tip.textContent='';var t=document.createElement('div');t.textContent=el.getAttribute('data-tip');tip.appendChild(t);
+var u=el.getAttribute('data-url');if(u&&/^https?:\/\//.test(u)){var a=document.createElement('a');a.href=u;a.target='_blank';a.rel='noopener noreferrer';
+a.textContent='Open post ↗';tip.appendChild(a);}tip.hidden=false;place(el);cur=el;pinned=!!pin;}
+function hide(){tip.hidden=true;cur=null;pinned=false;}
+document.querySelectorAll('[data-tip]').forEach(function(el){
+el.addEventListener('mouseenter',function(){if(!pinned)show(el,false);});
+el.addEventListener('mouseleave',function(){if(!pinned)hide();});
+el.addEventListener('focus',function(){show(el,false);});
+el.addEventListener('blur',function(e){if(!pinned&&!tip.contains(e.relatedTarget))hide();});
+el.addEventListener('click',function(e){e.stopPropagation();if(cur===el&&pinned){hide();}else{show(el,true);}});
+el.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();show(el,true);var a=tip.querySelector('a');if(a)a.focus();}
+if(e.key==='Escape')hide();});});
+tip.addEventListener('keydown',function(e){if((e.key==='Escape'||e.key==='Tab')&&cur){var c=cur;
+if(e.key==='Escape'){e.preventDefault();e.stopPropagation();c.focus();hide();}
+else if(e.shiftKey){e.preventDefault();c.focus();}else{hide();c.focus();}}});
+document.addEventListener('click',function(e){if(!tip.contains(e.target))hide();});
+document.addEventListener('keydown',function(e){if(e.key==='Escape'&&cur){var c=cur,back=tip.contains(document.activeElement);
+if(back)c.focus();hide();}});
+window.addEventListener('resize',function(){if(cur&&!tip.hidden)place(cur);});})();
+"""
+
+
+def esc(x):
+    return html.escape("" if x is None else str(x), quote=True)
+
+
+def safe_url(u):
+    """An http(s) link from scraped data, or None, so a scraped value never becomes a script link."""
+    u = str(u or "").strip()
+    return u if re.fullmatch(r"https?://[^\s\"'<>`]+", u) else None
+
+
+def md_inline(text):
+    """The inline markdown the report writes (bold, italics, links), escaped
+    first; links are set aside while bold and italics apply, so a URL's
+    underscores stay a URL."""
+    links = []
+
+    def link(m):
+        label, url = m.group(1) or m.group(3), m.group(2) or m.group(4)
+        links.append(f'<a href="{url}">{label}</a>' if safe_url(html.unescape(url)) else label)
+        return f"\x00{len(links) - 1}\x00"
+    t = re.sub(r"\[([^\]]+)\]\(&lt;([^&]+)&gt;\)|\[([^\]]+)\]\(([^)\s]+)\)", link,
+               esc(str(text or "").replace("\x00", "")).replace("\\&lt;", "&lt;"))
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"(?<![\w*])_(.+?)_(?![\w*])", r"<i>\1</i>", t)
+    return re.sub(r"\x00(\d+)\x00", lambda m: links[int(m.group(1))], t)
+
+
+def md_block(lines):
+    """The subset of markdown the report writes (headings, paragraphs, lists, tables) as HTML."""
+    out, i = [], 0
+    lines = list(lines)
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith("|"):
+            rows = []
+            while i < len(lines) and lines[i].startswith("|"):
+                if not re.fullmatch(r"\|(\s*:?-+:?\s*\|)+", lines[i].strip()):
+                    rows.append([c.strip() for c in lines[i].strip().strip("|").split(" | ")])
+                i += 1
+            if rows:
+                out.append("<div class='tw'><table><tr>" + "".join(f"<th>{md_inline(c)}</th>" for c in rows[0]) + "</tr>"
+                           + "".join("<tr>" + "".join(f"<td>{md_inline(c)}</td>" for c in r) + "</tr>" for r in rows[1:])
+                           + "</table></div>")
+            continue
+        if ln.startswith("- "):
+            items = []
+            while i < len(lines) and lines[i].startswith("- "):
+                items.append(lines[i][2:])
+                i += 1
+            out.append("<ul>" + "".join(f"<li>{md_inline(x)}</li>" for x in items) + "</ul>")
+            continue
+        m = re.match(r"(#{2,4}) (.*)", ln)
+        if m:
+            out.append(f"<h3>{md_inline(m.group(2))}</h3>")
+        elif ln.strip():
+            out.append(f"<p>{md_inline(ln.strip())}</p>")
+        i += 1
+    return "\n".join(out)
+
+
+def tip_text(p):
+    bits = [p.get("date") or "no date", f"{fmt(p.get('views'))} views", f"{lift_txt(p)} lift"]
+    if p.get("pinned"):
+        bits.append("pinned")
+    if is_fresh(p):
+        bits.append("under 3 days old")
+    cap = (p.get("caption") or "").strip()
+    return " \u00b7 ".join(bits) + (f" \u2014 {cap[:120]}" if cap else "")
+
+
+def dot_chart(posts, median, title, shown=()):
+    """Views per post over time, log scale, as inline SVG. Approximate dates
+    (un-enriched YouTube) and hidden counts aren't plotted; the caption says how many."""
+    side = [p for p in posts if p.get("pinned") or p.get("top_lookup")]  # outside the window, or there for being hits
+    rest = [p for p in posts if not (p.get("pinned") or p.get("top_lookup"))]
+    pts = [p for p in rest if p.get("views") and p.get("date") and not p.get("date_approx")]
+    left_out = len(rest) - len(pts)
+    if len(pts) < 3:
+        return f"<p class='note'>Not enough exactly dated posts with views to chart ({len(pts)}).</p>"
+    ds = [dt.date.fromisoformat(p["date"]) for p in pts]
+    d0, d1 = min(ds), max(ds)
+    span = max((d1 - d0).days, 1)
+    vs = [p["views"] for p in pts] + ([median] if median else [])
+    lo = math.floor(math.log10(max(min(vs), 1)))
+    hi = max(math.ceil(math.log10(max(vs))), lo + 1)
+    w, h, L, R, T, B = 900, 270, 70, 16, 14, 30
+    x = lambda d: L + (d - d0).days / span * (w - L - R)
+    y = lambda v: T + (hi - math.log10(max(v, 1))) / (hi - lo) * (h - T - B)
+    out = [f'<svg viewBox="0 0 {w} {h}" role="img" aria-label="{esc(title)}: views per post over time, log scale">']
+    for k in range(lo, hi + 1):
+        for mult in ((1, 3) if hi - lo <= 2 else (1,)):
+            v = mult * 10 ** k
+            if v > 10 ** hi or v < 10 ** lo:
+                continue
+            yy = y(v)
+            out.append(f'<line class="gl" x1="{L}" x2="{w - R}" y1="{yy:.1f}" y2="{yy:.1f}"/>'
+                       f'<text x="{L - 8}" y="{yy + 4:.1f}" text-anchor="end">{fmt(v)}</text>')
+    if d0 == d1:  # one day of posts: centre them under a single date
+        x = lambda d: (L + w - R) / 2
+        ticks = [(d0, "middle")]
+    else:
+        ticks = [(d0, "start"), (d1, "end")] + ([(d0 + (d1 - d0) / 2, "middle")] if span >= 14 else [])
+    for d, anchor in ticks:  # the edge labels anchor inward, so neither is clipped
+        out.append(f'<text x="{x(d):.1f}" y="{h - 8}" text-anchor="{anchor}">{d.isoformat()}</text>')
+    if median:
+        ym = y(median)
+        out.append(f'<line class="med" x1="{L}" x2="{w - R}" y1="{ym:.1f}" y2="{ym:.1f}"/>'
+                   f'<text class="medl" x="{L + 6}" y="{ym - 6:.1f}">median {fmt(median)}</text>')
+    drawn = set()
+    for p, d in sorted(zip(pts, ds), key=lambda t: (t[0].get("lift") or 0)):  # hits drawn last, on top
+        cls = "pt hit" if (p.get("lift") or 0) >= 2 else "pt fresh" if is_fresh(p) else "pt"
+        drawn.add(cls)
+        url = safe_url(p.get("url"))
+        cx, cy = f"{x(d):.1f}", f"{y(p['views']):.1f}"
+        out.append(f'<g class="{cls}" tabindex="0" role="button" aria-label="{esc(tip_text(p))}" '
+                   f'data-tip="{esc(tip_text(p))}"' + (f' data-url="{esc(url)}"' if url else "")
+                   + f'><circle class="zone" cx="{cx}" cy="{cy}" r="12"/>'
+                   f'<circle class="dot" cx="{cx}" cy="{cy}" r="{6.5 if "hit" in cls else 5}"/></g>')
+    out.append("</svg>")
+    note = (f" {left_out} post{'' if left_out == 1 else 's'} with no exact date or no view count "
+            f"{'isn' if left_out == 1 else 'aren'}'t plotted." if left_out else "")
+    if side:
+        here = sum(1 for p in side if any(p is q for q in shown))
+        note += (f" {len(side)} pinned or looked-up post{'' if len(side) == 1 else 's'} "
+                 f"{'isn' if len(side) == 1 else 'aren'}'t plotted (outside the window, or looked up for being hits)"
+                 + (f"; {here} {'is' if here == 1 else 'are'} in the top posts table below" if here else "")
+                 + ("; posts.csv lists " + ("the rest" if here else "them") + " (pinned, top_lookup)"
+                    if here < len(side) else "") + ".")
+    keys = (["<span class='sw' style='background:var(--accent)'></span>2x the median or more (larger dots)"]
+            if "pt hit" in drawn else [])
+    keys += ["<span class='sw' style='background:var(--muted)'></span>the rest"] if "pt" in drawn else []
+    keys += ["<span class='sw' style='border:1.5px solid var(--muted)'></span>under 3 days old"] if "pt fresh" in drawn else []
+    return ("<p class='legend'>Each dot is a post (log scale)." + "".join(keys)
+            + ("; dashed line = median" if median else "") + f". Hover or tap a dot for its caption.{esc(note)}</p>"
+            "<div class='chart'>" + "".join(out) + "</div>")
+
+
+def bars(rows, lead_bucket):
+    """One format table as bars of median lift, with a 1x reference line."""
+    top = max([r["median_lift"] for r in rows] + [2.0])
+    one = 1 / top * 100
+    out = ["<div class='bars'>"]
+    for r in rows:
+        width = min(r["median_lift"] / top * 100, 100)
+        posts = f"{r['n']} on {r['days']} day{'' if r['days'] == 1 else 's'}" \
+            if r.get("days") is not None and r["days"] < r["n"] else f"{r['n']} post{'' if r['n'] == 1 else 's'}"
+        out.append(f"<span>{esc(r['bucket'])}{' <span class=note>(thin)</span>' if r['thin'] else ''}</span>"
+                   f"<span class='bar{' thin' if r['thin'] else ''}' role='img' aria-label='{esc(r['bucket'])}: "
+                   f"{r['median_lift']:.2f}x median lift'><i class='{'lead' if r['bucket'] == lead_bucket else ''}' "
+                   f"style='width:{width:.1f}%'></i><b style='left:{one:.1f}%'></b></span>"
+                   f"<span class='num'>{r['median_lift']:.2f}x \u00b7 {posts} \u00b7 {r['share_2x'] * 100:.0f}% at 2x+</span>")
+    return "".join(out) + "</div>"
+
+
+def frame_src(out, rel, own):
+    """A hook frame as an embedded image for the client's own account, else None
+    (a competitor's footage isn't copied into a page that gets shared)."""
+    if not own or not rel:
+        return None
+    path = os.path.realpath(os.path.join(out, rel))  # a symlink resolves to where it really points
+    if not path.startswith(os.path.realpath(os.path.join(out, "hooks")) + os.sep) or not os.path.isfile(path):
+        return None
+    kind = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".webp": "webp"}.get(os.path.splitext(path)[1].lower())
+    if not kind or os.path.getsize(path) > 400_000:
+        return None
+    with open(path, "rb") as f:
+        return f"data:image/{kind};base64," + base64.b64encode(f.read()).decode()
+
+
+def html_report(out, name, pulled, groups, all_posts, metas, formats, since_L, pod_L, window_L, own=False,
+                since=None, since_notes=(), caveats=None):
+    """report.html: one self-contained page (inline CSS, SVG and a little JS;
+    nothing loaded from anywhere) for sending to a client. It carries the same
+    caveats summary.md puts on each group, and says when it covers a --since window."""
+    caveats = caveats or {}
+    title = f"{display_name(out, name)}: social scan" + (f" since {since}" if since else "")
+    H = ["<!doctype html><html lang='en'><head><meta charset='utf-8'>",
+         "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+         f"<title>{esc(title)}</title><style>{HTML_CSS}</style></head><body><main>",
+         f"<h1>{esc(title)}</h1>",
+         f"<p class='sub'>Public, logged-out data pulled {esc(pulled)}"
+         + (f": {len(all_posts)} posts" + (f" since {esc(since)}" if since else "") + ". Views are plays, not unique viewers"
+            if all_posts else "") + ".</p>"]
+    H += [f"<p class='note'>{md_inline(x)}</p>" for x in list(window_L) + list(since_notes) if x.strip()]
+    tiles = [(fmt(m.get("followers")), f"{plat} {'subscribers' if plat == 'youtube' else 'followers'}")
+             for plat, m in metas.items() if m.get("followers") is not None]
+    flagged = {grp for grp, ls in caveats.items() if any(x.startswith(("**Check the profile", "**Unreliable sample"))
+                                                         or "before quoting" in x for x in ls)}
+    tiles += [(f"under {fmt(g['median_under'])}" if g.get("median_under") is not None else fmt(g.get("median")),
+               f"{g['group']} median views" + (" (see its notes before quoting)" if g["group"] in flagged else ""))
+              for _, g in groups if g.get("median") or g.get("median_under")]
+    if tiles:
+        H.append("<div class='tiles'>" + "".join(f"<div class='tile'><b>{esc(v)}</b><span>{esc(k)}</span></div>"
+                                                 for v, k in tiles) + "</div>")
+    if groups:
+        H += ["<h2>Scorecard</h2><div class='tw'><table><tr><th>Group</th><th>Posts</th><th>Per week</th><th>Median views</th>"
+              "<th>Max</th><th>Top 3 share</th><th>Outliers 5x+ / 2-5x / 1.5-2x</th><th>Confidence</th></tr>"]
+        for _, g in groups:
+            t = g.get("tiers")
+            med = f"under {fmt(g['median_under'])}" if g.get("median_under") is not None else fmt(g.get("median"))
+            H.append(f"<tr><td>{esc(g['group'])}</td><td>{g['posts']}</td><td>{esc(per_week_txt(g))}</td><td>{esc(med)}</td>"
+                     f"<td>{fmt(g.get('max'))}</td><td>{('≤' if g.get('top3_upper') and g.get('top3_share') is not None else '') + pct(g.get('top3_share'))}</td>"
+                     f"<td>{(str(t['huge']) + ' / ' + str(t['strong']) + ' / ' + str(t['mild'])) if t else 'n/a'}</td>"
+                     f"<td>{esc(g['confidence'])} ({g['baseline_n']})</td></tr>")
+        H.append("</table></div>")
+    if pod_L:
+        H += ["<h2>Podcast</h2>", md_block([x for x in pod_L if not x.startswith("## ")])]
+    if since_L:
+        H += ["<h2>Since last scan</h2>", md_block([x for x in since_L if not x.startswith("## ")])]
+    fgroups = (formats or {}).get("groups") or {}
+    hooks = load(os.path.join(out, "hooks.json"), []) or []
+    live = {(p["platform"], p["id"]): p for p in all_posts}
+    hooks = [] if hooks_stale(out) else [e for e in hooks if (e.get("platform"), e.get("id")) in live]
+    shown_formats = False
+    for _, g in groups:
+        if not g.get("top"):  # as summary.md: a group with nothing to rank gets its scorecard row only
+            continue
+        mine = [p for p in all_posts if p.get("group") == g["group"]]
+        H.append(f"<h2>{esc(g['group'].title())}</h2>")
+        H.append(f"<p class='sub'>{esc(window_txt(g))}. Median {esc(fmt(g.get('median')) if g.get('median_under') is None else 'under ' + fmt(g['median_under']))} "
+                 f"views across {g['baseline_n']} posts (confidence {esc(g['confidence'])}).</p>")
+        for x in caveats.get(g["group"]) or []:  # the same warnings summary.md puts under the group
+            H.append(f"<p class='note{' warn' if x.startswith(('**Check the profile', '**Unreliable')) else ''}'>"
+                     f"{md_inline(x)}</p>")
+        top = (g.get("top") or [])[:5]
+        H.append(dot_chart(mine, g.get("median"), g["group"], shown=top))
+        if top:
+            H += ["<h3>Top posts" + (" (ranked by likes: half or more of the view counts are hidden)"
+                                     if g.get("rank_by") == "likes" else "") + "</h3>"
+                  "<div class='tw'><table><tr><th>Date</th><th>Views</th><th>Lift</th><th>Likes</th><th>Opening line</th></tr>"]
+            for p in top:
+                url = safe_url(p.get("url"))
+                v = f"<a href='{esc(url)}'>{fmt(p.get('views'))}</a>" if url else fmt(p.get("views"))
+                H.append(f"<tr><td>{esc(p.get('date') or '?')}{esc(flags(p))}</td><td>{v}</td><td>{esc(lift_txt(p))}</td>"
+                         f"<td>{fmt(p.get('likes'))}</td><td>{esc(p.get('caption') or '(no caption)')}</td></tr>")
+            H.append("</table></div>")
+        f = fgroups.get(g["group"])
+        if f and f.get("lead"):
+            shown_formats = True
+            tz = esc((formats or {}).get("tz") or "")
+            H += ["<h3>What formats work</h3>", f"<p class='note'>{md_inline(f['lead'])}</p>",
+                  f"<p class='note'>Bars show each row's median lift; the dashed line in each is 1x: the group's median"
+                  + (", or for a table that covers only some posts, those posts' own median (named beside it)"
+                     if any((f.get("rebased_median_views") or {}).values()) else "") + ". "
+                  f"Thin rows (hatched) have under {FORMAT_MIN_N} posts, or for weekday and time come from fewer than "
+                  f"{FORMAT_MIN_DAYS} dates: read them as anecdotes. One account's own posts, so a strong row is something "
+                  "to test, not a rule.</p>"]
+            leads = {k: (v.get("bucket") if v.get("finding") else None) for k, v in (f.get("strongest") or {}).items()}
+            heads = {"length": "Length", "weekday": "Weekday", "time": "Posted, 3-hour blocks"}
+            for k in ("length", "weekday", "time"):
+                rows = f.get(k) or []
+                if len(rows) >= 2 and not all(r["thin"] for r in rows):
+                    base = (f.get("rebased_median_views") or {}).get("length" if k == "length" else "weekday_time")
+                    bits = ([tz] if tz and k != "length" else []) + ([f"1x = {fmt(base)} views"] if base else [])
+                    H += [f"<p class='tag'>{heads[k]}" + (f" ({'; '.join(bits)})" if bits else "") + "</p>",
+                          bars(rows, leads.get(k))]
+            H += [f"<p class='note'>{md_inline(x)}</p>" for x in f.get("lines") or []]
+            H += [f"<p>{md_inline(x)}</p>" for x in f.get("notes") or []]
+        mine_hooks = [e for e in hooks if live[(e["platform"], e["id"])].get("group") == g["group"] and e.get("role") == "top"]
+        if mine_hooks:
+            secs = HOOK_WINDOW_MS // 1000
+            H.append("<h3>Hooks on the top posts</h3>")
+            if any(e.get("spoken_hook") for e in mine_hooks[:3]):
+                H.append(f"<p class='note'>Spoken = a machine transcript of the first {secs} seconds (whisper-cli, or "
+                         "Snapchat's own for Spotlights). It can get names and small words wrong: check it against the "
+                         "video before quoting.</p>")
+            H.append("<div class='hooks'>")
+            for e in mine_hooks[:3]:
+                p = live[(e["platform"], e["id"])]
+                src = frame_src(out, e.get("frame"), own)
+                url = safe_url(e.get("url"))
+                text_hook = caption_hook(p.get("hook_text")) if p.get("hook_text") else e.get("text_hook")
+                H.append("<div class='hook'>" + (f"<img alt='First frame of the post' src='{src}'>" if src else "")
+                         + f"<div class='tag'>{fmt(p.get('views'))} views \u00b7 {esc(lift_txt(p))}</div>"
+                         + f"<p><b>Text:</b> {esc(text_hook or '(no caption)')}</p>"
+                         + (f"<p><b>Spoken (machine transcript):</b> \u201c{esc(e['spoken_hook'])}\u201d</p>"
+                            if e.get("spoken_hook") else "")
+                         + (f"<a href='{esc(url)}'>Open post</a>" if url else "") + "</div>")
+            H.append("</div>")
+            if not own and any(e.get("frame") for e in mine_hooks):
+                H.append("<p class='note'>First frames are in the scan folder's hooks/ and aren't copied into this page: "
+                         "it's someone else's footage unless the scan ran with --own-account.</p>")
+    H += ["<h2>Read this before quoting numbers</h2><ul class='note'>"]
+    if all_posts:
+        H += ["<li>Views are plays from a logged-out view; none are unique viewers. Lift compares a post with its own "
+              "group's median, never across platforms or accounts.</li>",
+              "<li>Posts under 3 days old are still climbing. Pinned posts are kept out of the chart and the medians.</li>"]
+    if shown_formats:
+        H.append("<li>The format tables slice one account's own posts: a strong row is something to test, not a rule.</li>")
+    H += ["<li>" + ("Reach, follows per post, retention and ad spend need the account's own analytics. " if all_posts else
+                    "Downloads and listens aren't public, so this shows standing, not audience size. ")
+          + "The full report, with every table and caveat, is summary.md beside this page.</li></ul>",
+          "<div id='tip' hidden></div></main>", f"<script>{HTML_JS}</script></body></html>"]
+    path = os.path.join(out, "report.html")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f_:
+            f_.write("\n".join(H))
+        os.replace(tmp, path)  # a failed write never leaves a half page
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    print(f"  report: report.html ({os.path.getsize(path) // 1024} KB" + (", the account's own hook frames embedded"
+                                                                          if own else "") + ")", file=sys.stderr)
+    return path
 
 
 # ---------- collect windows (--days) ----------
@@ -2929,7 +3319,7 @@ def since_last(prior, now, name, out):
             + (" (earlier the same day)" if days == 0 else f" ({days} day{'' if days == 1 else 's'} earlier)")
             if days is not None else "") + "."]
     if then.get("name") and name and norm_name(then["name"]) != norm_name(name):
-        L.append(f"The earlier report is titled \"{then['name']}\": check it's the same account.")
+        L.append(f"The earlier report is titled \"{md_plain(then['name'])}\": check it's the same account.")
 
     rows = []
     for plat in PLATFORMS:
@@ -2959,7 +3349,8 @@ def since_last(prior, now, name, out):
                           f"not in the top {c['size']}" if c.get("size") else "couldn't read")
         crow = [f"| {c.get('source')} {c.get('chart')} | {rank(old_c.get((c.get('source'), c.get('chart'))))} | {rank(c)} |"
                 for c in pn.get("charts") or [] if isinstance(c, dict)]
-        L += ["", f"**Podcast** ({pn.get('name')}): " + ("; ".join(bits) if bits else "no comparable totals") + "."]
+        L += ["", f"**Podcast** ({md_plain(pn.get('name')).replace('[', '(').replace(']', ')')}): "
+              + ("; ".join(bits) if bits else "no comparable totals") + "."]
         if crow:
             L += ["", "| Chart | Then | Now |", "|---|---|---|"] + crow
 
@@ -3045,7 +3436,7 @@ def since_last(prior, now, name, out):
             for p in top:
                 v = f"[{fmt(p.get('views'))}]({p['url']})" if p.get("url") else fmt(p.get("views"))
                 L.append(f"| {p.get('group') or group_of(p)} | {p.get('date') or '?'}{flags(p)} | {v} | {lift_txt(p)} | "
-                         f"{cell(p.get('caption')) or '_(no caption)_'} |")
+                         f"{md_plain(cell(p.get('caption'))) or '_(no caption)_'} |")
         grew = sorted(((max(step(a), step(b)), b["views"] - a["views"], a, b) for a, b in both
                        if a.get("views") is not None and b.get("views") is not None and b["views"] > a["views"]),
                       key=lambda t: -(t[1] - t[0]))  # ranked by what the gain is at least, so a rounding step can't lead
@@ -3179,14 +3570,25 @@ def snapchat_history_lines(out):
     return L
 
 
-def report(out, name, since, note=None, prior="auto", tz=None):
-    """summary.md, summary.json and posts.csv, measured as of the day the
-    folder's data was collected, so a later re-render reads the same."""
+def display_name(out, name=None):
+    """The report's title: the given name, else the folder's, or for a dated
+    folder (<account>/<YYYY-MM-DD>/) the account folder's."""
+    if name:
+        return name
+    base = os.path.basename(os.path.abspath(out))
+    parent = os.path.basename(os.path.dirname(os.path.abspath(out)))
+    return parent if DATED_DIR.fullmatch(base) and parent else base
+
+
+def report(out, name, since, note=None, prior="auto", tz=None, html_page=False, own=False):
+    """summary.md, summary.json and posts.csv (and report.html with html_page),
+    measured as of the day the folder's data was collected, so a later
+    re-render reads the same."""
     with as_of(collected_on(out)[0]):
-        return build_report(out, name, since, note, prior, tz)
+        return build_report(out, name, since, note, prior, tz, html_page, own)
 
 
-def build_report(out, name, since, note, prior, tz=None):
+def build_report(out, name, since, note, prior, tz=None, html_page=False, own=False):
     all_posts, metas, undated_dropped = load_posts(out, since)
     # the top-post lookups among the whole folder's posts, and those --since left out (it reads them as listed)
     every = load_posts(out)[0] if since else all_posts
@@ -3225,10 +3627,11 @@ def build_report(out, name, since, note, prior, tz=None):
     if not name and not all_posts:  # a podcast-only folder
         name = (load(os.path.join(out, "podcast.json")) or {}).get("name")
     pulled = collected_on(out, metas)[0] or TODAY.isoformat()
-    L = [f"# Social scan: {name or os.path.basename(os.path.abspath(out))}",
+    L = [f"# Social scan: {md_plain(display_name(out, name))}",
          f"Pulled {pulled} from public, logged-out data."
          + ((f" {len(all_posts)} posts" + (f" since {since}." if since else ".")) if all_posts else "")]
-    L += window_lines(out, sorted({p["platform"] for p in all_posts})) + [""]
+    window_L = window_lines(out, sorted({p["platform"] for p in all_posts}))
+    L += window_L + [""]
 
     if metas:
         L += ["## Accounts", "| Platform | Followers | Following | Source |", "|---|---|---|---|"]
@@ -3239,7 +3642,8 @@ def build_report(out, name, since, note, prior, tz=None):
                 L.append(f"| {plat} | {fmt(m.get('followers'))} | {fmt(m.get('following'))} | {src} |")
         L.append("")
 
-    L += podcast_section(out)
+    pod_L = podcast_section(out)
+    L += pod_L
     since_L = []
     if prior:
         try:
@@ -3252,8 +3656,30 @@ def build_report(out, name, since, note, prior, tz=None):
             msg = f"Since last scan left out: {e}"
             note(msg) if note else print(f"  report: {msg}", file=sys.stderr)
             prior = None
+    caveats, since_notes = {}, []
+
+    def page(formats=None):
+        """report.html after summary.md: a failure here costs only the page, with a note."""
+        path_html = os.path.join(out, "report.html")
+        if not html_page:
+            if os.path.exists(path_html):
+                msg = ("report.html is from an earlier run and wasn't rebuilt: add --html (and --own-account if it "
+                       "embedded hook frames) to rebuild it")
+                note(msg) if note else print(f"  report: {msg}", file=sys.stderr)
+            return
+        try:
+            html_report(out, name, pulled, groups, all_posts, metas, formats, since_L, pod_L, window_L, own,
+                        since=since, since_notes=since_notes, caveats=caveats)
+        except Exception as e:  # noqa: BLE001 -- the markdown report is already written
+            msg = f"report.html left out: {type(e).__name__}: {e}" + (
+                "; the report.html in this folder is from an earlier run and doesn't match this summary.md, so "
+                "don't send it" if os.path.exists(path_html) else "")
+            note(msg) if note else print(f"  report: {msg}", file=sys.stderr)
+
     if not all_posts:
-        return finish_report(out, name, L + since_L, groups, all_posts, metas, prior, since)
+        done = finish_report(out, name, L + since_L, groups, all_posts, metas, prior, since)
+        page()
+        return done
     L += ["## Scorecard",
           "| Group | Posts | Per week | Median views | Max | Top 3 share | Outliers 5x+ / 2-5x / 1.5-2x | Confidence | Like rate (n) | Comment rate | Followers per 1K views (proxy) |",
           "|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -3267,14 +3693,16 @@ def build_report(out, name, since, note, prior, tz=None):
                  f"{fmt(s.get('max'))} | {t3} | {tiers} | {s['confidence']} ({s['baseline_n']}) | "
                  f"{pct(s['like_rate'])}{rn} | {pct(s['comment_rate'])} | {s.get('followers_per_1k') or 'n/a'} |")
     if undated_dropped:
-        L.append(f"\n{undated_dropped} posts with no listed date left out by --since (YouTube Shorts past --yt-enrich"
-                 + (f"; {lookups_dropped} of them are top posts looked up for the top-posts tables, which --since reads "
-                    "as listed, so the window's numbers match a scan without those lookups" if lookups_dropped else "")
-                 + ").")
+        since_notes.append(f"{undated_dropped} posts with no listed date left out by --since (YouTube Shorts past --yt-enrich"
+                           + (f"; {lookups_dropped} of them are top posts looked up for the top-posts tables, which --since "
+                              "reads as listed, so the window's numbers match a scan without those lookups"
+                              if lookups_dropped else "") + ").")
+        L.append("\n" + since_notes[-1])
     approx_kept = sum(1 for p in all_posts if as_listed(p)[0] and as_listed(p)[1]) if since else 0
     if approx_kept:
-        L.append(f"\n{approx_kept} posts kept by --since have approximate dates (un-enriched YouTube uploads), "
-                 f"so some may be older than {since}.")
+        since_notes.append(f"{approx_kept} posts kept by --since have approximate dates (un-enriched YouTube uploads), "
+                           f"so some may be older than {since}.")
+        L.append("\n" + since_notes[-1])
     L.append("")
     L += since_L
 
@@ -3285,6 +3713,7 @@ def build_report(out, name, since, note, prior, tz=None):
         med = f"under {fmt(s['median_under'])}" if s.get("median_under") is not None else fmt(s.get("median"))
         duds = f"{len(s.get('duds') or [])} under 0.2x" + (
             f", {s['duds_unknown']} hidden counts unknown" if s.get("duds_unknown") else "")
+        mark = len(L) + 2  # the caveat lines start after the heading and the baseline line
         L += [f"## {s['group'].title()}",
               f"{window_txt(s)}. Baseline: median {med} views across {s['baseline_n']} posts, confidence "
               f"{s['confidence']}. " + (f"Outliers: {t['huge']} at 5x+, {t['strong']} at 2-5x, {t['mild']} at 1.5-2x; "
@@ -3341,6 +3770,7 @@ def build_report(out, name, since, note, prior, tz=None):
                if p["platform"] == "instagram" and p.get("group") == s["group"]):
             L.append("**Unreliable sample:** this came from the Instagram posts feed, which skips posts past the first 12 "
                      "when logged out. Re-run with the reels scrape before quoting it.")
+        caveats[s["group"]] = [x for x in L[mark:] if x.strip()]
         L += ["", "**Top posts** (" + ("ranked by likes; " if s.get("rank_by") == "likes" else "")
               + "lift = views / this group's median)",
               "| Date | Views | Lift | Tier | Eng. lift (likes+comments) | Likes | Opening line |",
@@ -3348,12 +3778,12 @@ def build_report(out, name, since, note, prior, tz=None):
         for p in s["top"]:
             el = f"{p['eng_lift']:.1f}x" if p.get("eng_lift") is not None else "n/a"
             L.append(f"| {p.get('date') or '?'}{flags(p)} | [{fmt(p['views'])}]({p['url']}) | {lift_txt(p)} | "
-                     f"{p.get('tier') or ''} | {el} | {fmt(p.get('likes'))} | {p['caption'] or '_(no caption)_'} |")
+                     f"{p.get('tier') or ''} | {el} | {fmt(p.get('likes'))} | {cell(p['caption']) or '_(no caption)_'} |")
         L += ["", "**Bottom 5**" + (" (by likes)" if s.get("rank_by") == "likes" else ""),
               "| Date | Views | Lift | Likes | Opening line |", "|---|---|---|---|---|"]
         for p in s["bottom"]:
             L.append(f"| {p.get('date') or '?'}{flags(p)} | [{fmt(p['views'])}]({p['url']}) | {lift_txt(p)} | "
-                     f"{fmt(p.get('likes'))} | {p['caption'] or '_(no caption)_'} |")
+                     f"{fmt(p.get('likes'))} | {cell(p['caption']) or '_(no caption)_'} |")
         if s["group"] == "snapchat spotlight":
             snaps = [p for p in all_posts if p["platform"] == "snapchat"]
             L += [""] + spotlight_checks(snaps, metas.get("snapchat") or {})
@@ -3408,7 +3838,9 @@ def build_report(out, name, since, note, prior, tz=None):
           "Photos and carousels aren't sampled. Pinned posts are shown but kept out of every window figure "
           "(reports before 2026-10-15 counted them in the median).",
           "- Reach, follows per post, retention and ad spend need the client's own analytics access."]
-    return finish_report(out, name, L, groups, all_posts, metas, prior, since, formats)
+    done = finish_report(out, name, L, groups, all_posts, metas, prior, since, formats)
+    page(formats)
+    return done
 
 
 def finish_report(out, name, L, groups, all_posts, metas, prior=None, since=None, formats=None):
@@ -3779,7 +4211,8 @@ def scan(a):
                  "or use a new --out folder if it's another show")
     posts, metas, _ = load_posts(a.out)
     if not posts and os.path.exists(pj):  # a podcast-only scan
-        path = report(a.out, a.name or pod_info.get("name"), None, note=note, prior=prior, tz=a.tz)
+        path = report(a.out, a.name or pod_info.get("name"), None, note=note, prior=prior, tz=a.tz, html_page=a.html,
+                      own=a.own_account)
         print(f"\nscan finished in {time.time() - t0:.0f} s", file=sys.stderr)
         if notes:
             print("Notes:", file=sys.stderr)
@@ -3867,7 +4300,7 @@ def scan(a):
                          + (f"the earlier ones ({kept} posts)" if kept else "left out"))
     prev = load(os.path.join(a.out, "summary.json"), {}) or {}
     name = a.name or (handle_of(todo[0][1]) if todo else None) or prev.get("name") or pod_info.get("name")
-    path = report(a.out, name, None, note=note, prior=prior, tz=a.tz)
+    path = report(a.out, name, None, note=note, prior=prior, tz=a.tz, html_page=a.html, own=a.own_account)
 
     print(f"\nscan finished in {time.time() - t0:.0f} s", file=sys.stderr)
     if (load(os.path.join(a.out, "summary.json")) or {}).get("prior"):
@@ -3939,6 +4372,10 @@ def main():
                         "(logged out, unsigned; it can stop answering at any time)")
     s.add_argument("--tz", type=tz_arg, help="time zone for the weekday and posting-time tables: a name like "
                    "America/New_York (Python 3.9+), UTC, or an offset like UTC-05:00 (default: this computer's zone)")
+    s.add_argument("--html", action="store_true", help="also write report.html, a one-page report with charts "
+                   "(self-contained: no scripts or fonts loaded from anywhere)")
+    s.add_argument("--own-account", action="store_true", help="the account is your client's own: embed its hook "
+                   "frames in report.html (leave off for competitors, whose footage stays in hooks/)")
     s.add_argument("--prev", help="an earlier scan folder of this account to compare with (default: the newest "
                    "earlier dated folder beside --out)")
     s.add_argument("--no-prev", action="store_true", help="leave out the Since last scan section")
@@ -3992,6 +4429,10 @@ def main():
     r.add_argument("--since")
     r.add_argument("--tz", type=tz_arg, help="time zone for the weekday and posting-time tables: a name like "
                    "America/New_York (Python 3.9+), UTC, or an offset like UTC-05:00 (default: this computer's zone)")
+    r.add_argument("--html", action="store_true", help="also write report.html, a one-page report with charts "
+                   "(self-contained: no scripts or fonts loaded from anywhere)")
+    r.add_argument("--own-account", action="store_true", help="the account is your client's own: embed its hook "
+                   "frames in report.html (leave off for competitors, whose footage stays in hooks/)")
     r.add_argument("--prev", help="an earlier scan folder to compare with (default: the newest earlier dated folder)")
     r.add_argument("--no-prev", action="store_true", help="leave out the Since last scan section")
 
@@ -4070,7 +4511,8 @@ def main():
     elif a.cmd == "comments":
         comments(a.out, a.top, a.max, tiktok=a.tiktok)
     elif a.cmd == "report":
-        print(report(a.out, a.name, a.since, prior=None if a.no_prev else (a.prev or "auto"), tz=a.tz))
+        print(report(a.out, a.name, a.since, prior=None if a.no_prev else (a.prev or "auto"), tz=a.tz,
+                     html_page=a.html, own=a.own_account))
 
 
 if __name__ == "__main__":
