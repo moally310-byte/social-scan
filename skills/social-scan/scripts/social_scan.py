@@ -50,6 +50,7 @@ import csv
 import datetime as dt
 import json
 import os
+import random
 import re
 import shlex
 import shutil
@@ -368,7 +369,8 @@ def collect_youtube(handle, out, limit, enrich, days=None):
             ranked = sorted((p for p in posts if p["kind"] == kind and p["views"] is not None), key=lambda p: -p["views"])
             tops += [p for p in ranked[:TOP_LOOKUPS] if p["id"] not in chosen]
         for p in tops:
-            p.update(top_lookup=True, listed_date=p["date"], listed_date_approx=p["date_approx"])
+            p.update(top_lookup=True, listed_date=p["date"], listed_date_approx=p["date_approx"],
+                     listed_duration_s=p["duration_s"])
         enrich_all(targets + tops)
         print(f"  youtube: enriched {len(targets)} of {len(posts)}"
               + (f", plus {len(tops)} older top posts" if tops else ""), file=sys.stderr)
@@ -1387,7 +1389,8 @@ def as_listed(p):
 
 
 def is_fresh(p):
-    return bool(p.get("date")) and (TODAY - dt.date.fromisoformat(p["date"])).days < 3
+    d = as_listed(p)[0]  # a top-post lookup stays in or out of the baseline as its listing placed it
+    return bool(d) and (TODAY - dt.date.fromisoformat(d)).days < 3
 
 
 def tier_of(lift):
@@ -2089,45 +2092,56 @@ def spotlight_checks(posts, meta):
 # ---------- format tables ----------
 
 FORMAT_MIN_N = 5  # a row with fewer settled posts is shown but marked thin
+FORMAT_MIN_DAYS = 3  # a weekday row from fewer dates is thin too: one boosted day lifts every post on it
 FORMAT_MIN_SAMPLE = 10  # a group needs this many settled posts before it's cut at all
+FORMAT_SHUFFLES = 2000  # random splits behind the chance check on Strongest
 FORMAT_GROUPS = ("tiktok videos", "youtube shorts", "youtube long-form", "instagram reels")
 LEN_BUCKETS = ((0, 15, "under 15 s"), (15, 30, "15-30 s"), (30, 60, "30-60 s"), (60, 90, "60-90 s"),
                (90, 180, "90 s-3 min"), (180, 600, "3-10 min"), (600, 1200, "10-20 min"), (1200, 3600, "20-60 min"),
                (3600, None, "1 h+"))
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 BLOCKS = tuple(f"{h:02d}-{h + 3:02d}h" for h in range(0, 24, 3))
+OFFSET = re.compile(r"(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?", re.I)
 
 
 def zone_of(spec):
     """(tzinfo, label) for --tz: an IANA zone name (Python 3.9+), UTC, or a
-    fixed offset like -07:00. No spec: this computer's zone, as tzinfo None, so
-    each post converts with the offset in force on its own day."""
+    fixed offset like UTC-07:00. No spec: this computer's zone, as tzinfo None,
+    so each post converts with the offset in force on its own day; the label
+    follows TZ when it's set, as the conversion does."""
     if not spec:
         name = None
-        try:
-            real = os.path.realpath("/etc/localtime")
-            name = real.split("zoneinfo/", 1)[1] if "zoneinfo/" in real else None
-        except OSError:
-            pass
+        if "TZ" in os.environ:
+            v = os.environ["TZ"].lstrip(":")
+            name = (v.split("zoneinfo/", 1)[1] if "zoneinfo/" in v else
+                    v if re.fullmatch(r"[A-Za-z_]+(?:/[A-Za-z0-9_+-]+)+|UTC|GMT", v) else
+                    "UTC" if not v else None)  # a POSIX rule like EST5EDT falls back to tzname, which follows TZ
+        else:
+            try:
+                real = os.path.realpath("/etc/localtime")
+                name = real.split("zoneinfo/", 1)[1] if "zoneinfo/" in real else None
+            except OSError:
+                pass
         return None, name or "/".join(dict.fromkeys(time.tzname))
     spec = str(spec).strip()
     if spec.upper() in ("UTC", "GMT", "Z"):
         return dt.timezone.utc, "UTC"
-    m = re.fullmatch(r"(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?", spec, re.I)
+    m = OFFSET.fullmatch(spec)
     if m:
         h, mi = int(m.group(2)), int(m.group(3) or 0)
         if h > 14 or mi > 59:
-            raise ValueError(f"--tz {spec}: an offset runs from -14:00 to +14:00")
+            raise ValueError(f"--tz {spec}: an offset runs from UTC-14:00 to UTC+14:00")
         off = dt.timedelta(hours=h, minutes=mi) * (1 if m.group(1) == "+" else -1)
         return dt.timezone(off), f"UTC{m.group(1)}{h:02d}:{mi:02d}"
     try:
         from zoneinfo import ZoneInfo
     except ImportError:
-        raise ValueError(f"--tz {spec}: zone names need Python 3.9 or later; give an offset instead, like -07:00")
+        raise ValueError(f"--tz {spec}: zone names need Python 3.9 or later; give an offset instead, like UTC-07:00")
     try:
         return ZoneInfo(spec), spec
     except Exception:  # ZoneInfoNotFoundError, or a malformed key
-        raise ValueError(f"--tz {spec}: unknown time zone (use a name like America/New_York, or an offset like -05:00)")
+        raise ValueError(f"--tz {spec}: unknown time zone (use a name like America/New_York, or an offset like "
+                         "UTC-05:00)")
 
 
 def tz_arg(v):
@@ -2156,40 +2170,117 @@ def len_bucket(sec):
     return None
 
 
-def cut_row(bucket, rows):
+def cut_len(p):
+    """A post's length bucket as listed: a YouTube post looked up only as a top
+    post keeps the length its listing gave (none for a Short), so the hits
+    can't join a length table their older neighbours can't."""
+    if p.get("top_lookup"):
+        sec = p["listed_duration_s"] if "listed_duration_s" in p else (
+            None if p.get("kind") == "short" else p.get("duration_s"))  # 1.7.0 folders before this fix
+        return len_bucket(sec)
+    return len_bucket(p.get("duration_s"))
+
+
+def cut_row(bucket, rows, days=None):
     lifts = [p["lift"] for p in rows]
-    return {"bucket": bucket, "n": len(rows), "median_views": statistics.median(p["views"] for p in rows),
-            "median_lift": round(statistics.median(lifts), 2),
-            "n_2x": sum(1 for x in lifts if x >= 2), "share_2x": round(sum(1 for x in lifts if x >= 2) / len(lifts), 3),
-            "thin": len(rows) < FORMAT_MIN_N}
+    r = {"bucket": bucket, "n": len(rows), "median_views": statistics.median(p["views"] for p in rows),
+         "median_lift": round(statistics.median(lifts), 2),
+         "n_2x": sum(1 for x in lifts if x >= 2), "share_2x": round(sum(1 for x in lifts if x >= 2) / len(lifts), 3),
+         "thin": len(rows) < FORMAT_MIN_N or (days is not None and days < FORMAT_MIN_DAYS)}
+    if days is not None:
+        r["days"] = days
+    return r
 
 
 def format_cuts(posts, zone):
     """One video group's settled posts cut by length, weekday and 3-hour
-    posting block: (rows per cut, the posts in each bucket, posts with a time)."""
+    posting block. A cut that can place only some of the posts (lengths and
+    times exist only for looked-up YouTube uploads) is rebased on those posts'
+    own median views, so its rows compare like with like instead of carrying
+    the newest run's age against older posts. Returns (rows per cut, posts per
+    bucket, the sample, posts placed per cut, the rebased medians)."""
     sample = [p for p in posts if p.get("lift") is not None and p.get("views") is not None
               and not p.get("pinned") and not is_fresh(p)]
-    by = {"length": {}, "weekday": {}, "time": {}}
-    timed = 0
+    placed = {"length": [], "weekday": [], "time": []}
     for p in sample:
-        b = len_bucket(p.get("duration_s"))
+        b = cut_len(p)
         if b:
-            by["length"].setdefault(b, []).append(p)
+            placed["length"].append((b, p, None))
         # a top-post lookup has an exact time, but it's there for being a hit: it would tilt its weekday
         w = None if p.get("top_lookup") else posted_local(p, zone)
         if w:
-            timed += 1
-            by["weekday"].setdefault(WEEKDAYS[w.weekday()], []).append(p)
-            by["time"].setdefault(BLOCKS[w.hour // 3], []).append(p)
+            placed["weekday"].append((WEEKDAYS[w.weekday()], p, w.date()))
+            placed["time"].append((BLOCKS[w.hour // 3], p, None))
+    by, dates, bases = {}, {}, {}
+    for k, items in placed.items():
+        base = None
+        if items and len(items) < len(sample):
+            base = statistics.median(p["views"] for _, p, _ in items)
+        bases[k] = base if base else None
+        by[k], dates[k] = {}, {}
+        for bucket, p, day in items:
+            q = dict(p, lift=round(p["views"] / base, 2)) if base else p
+            by[k].setdefault(bucket, []).append(q)
+            dates[k].setdefault(bucket, set()).add(day)
     order = {"length": [b[2] for b in LEN_BUCKETS], "weekday": WEEKDAYS, "time": BLOCKS}
-    rows = {k: [cut_row(b, by[k][b]) for b in order[k] if b in by[k]] for k in by}
-    return rows, by, len(sample), timed
+    rows = {k: [cut_row(b, by[k][b], len(dates[k][b]) if k == "weekday" else None) for b in order[k] if b in by[k]]
+            for k in by}
+    return rows, by, sample, {k: len(v) for k, v in placed.items()}, bases
+
+
+def chance_of(by_k, observed):
+    """How often random splits of the same posts, each row keeping its size,
+    give some row of FORMAT_MIN_N+ posts a median lift of `observed` or more.
+    A fixed seed, so a re-render reads the same."""
+    sizes = [len(v) for v in by_k.values()]
+    lifts = [p["lift"] for v in by_k.values() for p in v]
+    if sum(1 for n in sizes if n >= FORMAT_MIN_N) < 1 or len(sizes) < 2:
+        return None
+    rng, hits = random.Random(0), 0
+    for _ in range(FORMAT_SHUFFLES):
+        rng.shuffle(lifts)
+        at, best = 0, None
+        for n in sizes:
+            if n >= FORMAT_MIN_N:
+                m = statistics.median(lifts[at:at + n])
+                best = m if best is None or m > best else best
+            at += n
+        hits += best >= observed - 1e-9
+    return hits / FORMAT_SHUFFLES
 
 
 def strongest(rows):
-    """The row with the highest median lift among rows of FORMAT_MIN_N+ posts, if it reaches 1.5x."""
+    """The row with the highest median lift among rows that aren't thin, if it reaches 1.5x."""
     best = max((r for r in rows if not r["thin"]), key=lambda r: (r["median_lift"], r["n"]), default=None)
     return best if best and best["median_lift"] >= 1.5 else None
+
+
+def count_why(counts, labels):
+    """("23 YouTube Shorts past --yt-enrich, 7 top posts ...") from {reason: count}, singular where it's one."""
+    parts = [(v, labels[k][0] if v == 1 else labels[k][1]) for k, v in counts.items() if v]
+    if len(parts) == 1:
+        v, t = parts[0]
+        return ("a " if v == 1 else "") + t
+    return ", ".join(f"{v} {t}" for v, t in parts)
+
+
+def missing_why(sample, zone):
+    """Why settled posts are missing from the length table and from the weekday and time tables."""
+    no_len = {"top": 0, "listing": 0, "old": 0}
+    no_time = {"top": 0, "listing": 0, "old": 0}
+    for p in sample:
+        yt = p.get("platform") == "youtube"
+        if not cut_len(p):
+            no_len["top" if p.get("top_lookup") else "listing" if yt and p.get("kind") == "short" else "old"] += 1
+        if p.get("top_lookup") or not posted_local(p, zone):
+            no_time["top" if p.get("top_lookup") else
+                    "listing" if yt and (not p.get("date") or p.get("date_approx")) else "old"] += 1
+    top = ("top post looked up only for the top-posts tables", "top posts looked up only for the top-posts tables")
+    return (count_why(no_len, {"top": top, "listing": ("YouTube Short past --yt-enrich", "YouTube Shorts past --yt-enrich"),
+                               "old": ("post with no length on record", "posts with no length on record")}),
+            count_why(no_time, {"top": top, "listing": ("YouTube upload past --yt-enrich", "YouTube uploads past --yt-enrich"),
+                                "old": ("post with no time on record, from before 1.7.0 or missing from the listing",
+                                        "posts with no time on record, from before 1.7.0 or missing from the listing")}))
 
 
 def formats_section(groups, all_posts, tz=None):
@@ -2201,11 +2292,14 @@ def formats_section(groups, all_posts, tz=None):
         return L, None
     L += ["## What formats work",
           f"Each row is a slice of one group's own posts: posts, median views, median lift (views over the group's "
-          f"median) and the share at 2x or more. Posts under 3 days old and pinned posts are left out; rows under "
-          f"{FORMAT_MIN_N} posts are marked thin, so read them as anecdotes. Weekday and time use each post's exact "
-          f"upload time in {label}" + ("" if tz else " (this computer's zone; --tz changes it)") + ". These slice one account's own posts, so a row can win for another reason (the "
-          "topic, a trend, a collab, or the length the posts in that row happened to be): treat a strong row as "
-          "something to test, not a rule."]
+          f"median, or over the median of the posts a table covers when that's only some of them) and the share at 2x "
+          f"or more. Posts under 3 days old and pinned posts are left out. Rows under {FORMAT_MIN_N} posts, and weekday "
+          f"rows from fewer than {FORMAT_MIN_DAYS} dates, are marked thin: read them as anecdotes. Weekday and time "
+          f"use each post's exact upload time in {label}" + ("" if tz else " (this computer's zone; --tz changes it)")
+          + ". **Strongest** needs a 1.5x median lift and a lead that random splits of the same posts rarely give "
+          "(under 5% of the time). These slice one account's own posts, so a row can still win for another reason "
+          "(the topic, a trend, a collab, or the length the posts in that row happened to be): treat a strong row "
+          "as something to test, not a rule."]
     if any(s["group"] in ("tiktok photos", "instagram photos/carousels") for _, s in groups):
         L.append("Photo carousels aren't cut: a carousel's listed length is its song's.")
     if any(s["group"] == "snapchat spotlight" for _, s in groups):
@@ -2213,83 +2307,105 @@ def formats_section(groups, all_posts, tz=None):
                  "checks cover length.")
     L.append("")
     heads = {"length": "Length", "weekday": "Weekday", "time": "Posted (3-hour block)"}
+    some = {"length": "length", "weekday": "day", "time": "block"}
     for s in cut:
         mine = [p for p in all_posts if p.get("group") == s["group"]]
-        rows, by, n, timed = format_cuts(mine, zone)
+        rows, by, sample, placed, bases = format_cuts(mine, zone)
+        n, timed, sized = len(sample), placed["weekday"], placed["length"]
         L.append(f"### {s['group'].title()}")
         if n < FORMAT_MIN_SAMPLE:
             L += [f"Only {n} settled post{'' if n == 1 else 's'}: too few to slice.", ""]
-            data["groups"][s["group"]] = {"posts": n, "timed": timed}
+            data["groups"][s["group"]] = {"posts": n, "timed": timed, "with_length": sized}
             continue
-        data["groups"][s["group"]] = {"posts": n, "timed": timed, **rows}
-        lead = f"{n} settled posts."
-        if timed < n:
-            why = untimed_why([p for p in mine if p.get("lift") is not None and p.get("views") is not None
-                               and not p.get("pinned") and not is_fresh(p)], zone)
-            lead += (f" None has an exact upload time ({why}), so there are no weekday or time tables." if not timed
-                     else f" {n - timed} have no exact upload time ({why})" + (
-                         " and stay out of the weekday and time tables." if timed >= FORMAT_MIN_SAMPLE else
-                         f", which leaves {timed}: too few for the weekday and time tables."))
         if timed < FORMAT_MIN_SAMPLE:
             rows["weekday"], rows["time"] = [], []
-            data["groups"][s["group"]].update(weekday=[], time=[])
+        if sized < FORMAT_MIN_SAMPLE:
+            rows["length"] = []
+        why_len, why_time = missing_why(sample, zone)
+        lead = f"{n} settled posts."
+        if sized < n:
+            lead += (f" {n - sized} {'has' if n - sized == 1 else 'have'} no length ({why_len})"
+                     + (f", which leaves {sized}: too few for the length table." if 0 < sized < FORMAT_MIN_SAMPLE else
+                        ", so there's no length table." if not sized else "."))
+        if timed < n:
+            lead += (f" {n - timed} {'is' if n - timed == 1 else 'are'} left out of the weekday and time tables "
+                     f"({why_time})" + (", so there are none." if not timed else
+                                        f", which leaves {timed}: too few for them." if timed < FORMAT_MIN_SAMPLE else "."))
+        rebased = [(k, bases[k]) for k in ("length", "weekday") if bases[k] and rows[k]]
+        names = {"length": "length", "weekday": "weekday and time"}
+        rebased = ([f"length, weekday and time: {fmt(rebased[0][1])}"] if len(rebased) == 2 and rebased[0][1] == rebased[1][1]
+                   else [f"{names[k]}: {fmt(v)}" for k, v in rebased])
+        if rebased:
+            lead += (" Tables that cover only some of these posts measure lift against those posts' own median views ("
+                     + "; ".join(rebased) + "), so their rows compare like with like.")
         L += [lead, ""]
+        shown = {}
         for k in ("length", "weekday", "time"):
             if len(rows[k]) < 2:  # one bucket isn't a comparison
                 if rows[k]:
                     L += [f"{heads[k]}: all {rows[k][0]['n']} in {rows[k][0]['bucket']}.", ""]
                 continue
             if all(r["thin"] for r in rows[k]):  # a table of anecdotes reads like a finding: say so instead
-                L += [f"{heads[k]}: every row has under {FORMAT_MIN_N} posts ({sum(r['n'] for r in rows[k])} across "
-                      f"{len(rows[k])}), too thin to read.", ""]
+                L += [f"{heads[k]}: every row is thin ({sum(r['n'] for r in rows[k])} posts across {len(rows[k])}), "
+                      "too thin to read.", ""]
                 continue
+            shown[k] = rows[k]
             L += [f"| {heads[k]} | Posts | Median views | Median lift | 2x+ |", "|---|---|---|---|---|"]
             for r in rows[k]:
-                L.append(f"| {r['bucket']}{' (thin)' if r['thin'] else ''} | {r['n']} | {fmt(r['median_views'])} | "
+                posts_txt = f"{r['n']} on {r['days']} day{'' if r['days'] == 1 else 's'}" \
+                    if r.get("days") is not None and r["days"] < r["n"] else str(r["n"])
+                L.append(f"| {r['bucket']}{' (thin)' if r['thin'] else ''} | {posts_txt} | {fmt(r['median_views'])} | "
                          f"{r['median_lift']:.2f}x | {r['share_2x'] * 100:.0f}% |")
             L.append("")
-        tops = {k: strongest(rows[k]) for k in rows}
-        found = [f"{k} {r['bucket']} ({r['median_lift']:.1f}x median lift, {r['n_2x']} of "
-                 f"{r['n']} at 2x+)" for k, r in tops.items() if r]
-        L.append("**Strongest:** " + "; ".join(found) + "." if found else
-                 f"**Strongest:** no row of {FORMAT_MIN_N}+ posts reaches a 1.5x median lift, so nothing stands out yet.")
-        lb = tops["length"]
-        for k in ("weekday", "time"):  # a weekday or time can win on the length of the posts in it
-            r = tops[k]
-            if not (lb and r):
+        found, maybe, verdict = [], [], {}
+        for k, rs in shown.items():  # only tables shown as a comparison are ranked
+            r = strongest(rs)
+            if not r:
                 continue
+            ch = chance_of(by[k], r["median_lift"])
+            verdict[k] = {"bucket": r["bucket"], "median_lift": r["median_lift"], "chance": ch,
+                          "finding": ch is not None and ch < 0.05}
+            if verdict[k]["finding"]:
+                found.append(f"{k} {r['bucket']} ({r['median_lift']:.1f}x median lift, {r['n_2x']} of {r['n']} at 2x+)")
+            else:
+                maybe.append(f"{k} {r['bucket']} leads at {r['median_lift']:.1f}x (n={r['n']}), but random splits of "
+                             f"these posts put some {some[k]} that high {round((ch or 0) * 100)}% of the time")
+        data["groups"][s["group"]] = {"posts": n, "timed": timed, "with_length": sized,
+                                      "rebased_median_views": {"length": bases["length"], "weekday_time": bases["weekday"]},
+                                      "strongest": verdict, **rows}
+        if found:
+            L.append("**Strongest:** " + "; ".join(found) + ".")
+        if maybe:
+            L.append("**Not a finding yet:** " + "; ".join(maybe) + ".")
+        if not found and not maybe:
+            L.append(f"**Strongest:** no row of {FORMAT_MIN_N}+ posts reaches a 1.5x median lift, so nothing stands out yet.")
+        lb = strongest(shown.get("length") or [])  # the caution runs on the leading length, chance or not
+        for k in ("weekday", "time"):  # a weekday or time can win on the length of the posts in it
+            v = verdict.get(k)
+            if not (lb and v and v["finding"]):
+                continue
+            r = next(x for x in shown[k] if x["bucket"] == v["bucket"])
             inside = by[k][r["bucket"]]
-            same = [p for p in inside if len_bucket(p.get("duration_s")) == lb["bucket"]]
-            rest = [p for p in inside if all(p is not q for q in same)]
-            # only when that length is over-represented here: a row with fewer long posts than the group can't owe its lead to them
-            if not same or len(same) / len(inside) <= lb["n"] / n:
+            # the share of that length among this cut's own posts with a length, against its share in the row
+            pool = [q for qs in by[k].values() for q in qs if cut_len(q)]
+            known = [q for q in inside if cut_len(q)]
+            same = [q for q in known if cut_len(q) == lb["bucket"]]
+            rest = [q for q in inside if all(q is not x for x in same)]
+            base = sum(1 for q in pool if cut_len(q) == lb["bucket"]) / len(pool) if pool else 1
+            if not same or len(same) / len(known) <= base:
                 continue
             if not rest:
                 L.append(f"**Check the length:** all {len(inside)} {r['bucket']} posts are {lb['bucket']}, the "
-                         "strongest length, so this row says nothing about the day or time on its own.")
+                         "leading length, so this row says nothing about the day or time on its own.")
                 continue
-            m = statistics.median(p["lift"] for p in rest)
-            if m < 0.75 * r["median_lift"] or len(rest) < FORMAT_MIN_N:
+            m = statistics.median(q["lift"] for q in rest)
+            if m < 0.75 * r["median_lift"] or (len(rest) < FORMAT_MIN_N and m < r["median_lift"]):
                 L.append(f"**Check the length:** {len(same)} of the {len(inside)} {r['bucket']} posts "
-                         f"{'is' if len(same) == 1 else 'are'} {lb['bucket']}, the strongest length; without "
+                         f"{'is' if len(same) == 1 else 'are'} {lb['bucket']}, the leading length; without "
                          f"{'it' if len(same) == 1 else 'them'} its median lift is {m:.2f}x "
                          f"(n={len(rest)}{', thin' if len(rest) < FORMAT_MIN_N else ''}).")
         L.append("")
     return L, data
-
-
-def untimed_why(sample, zone):
-    """Why some settled posts have no exact upload time, as a short list."""
-    n = {"top": 0, "listing": 0, "old": 0}
-    for p in sample:
-        if posted_local(p, zone) and not p.get("top_lookup"):
-            continue
-        n["top" if p.get("top_lookup") else
-          "listing" if p.get("platform") == "youtube" and (not p.get("date") or p.get("date_approx")) else "old"] += 1
-    text = {"top": "looked up only as top posts", "listing": "YouTube uploads past --yt-enrich",
-            "old": "collected before 1.7.0"}
-    parts = [(v, text[k]) for k, v in n.items() if v]
-    return parts[0][1] if len(parts) == 1 else ", ".join(f"{v} {t}" for v, t in parts)
 
 
 def save_rates_line(s):
@@ -2421,7 +2537,7 @@ def group_days(window, g, posts=None):
     w = (window or {}).get(plat)
     if w and w.get("reached") and not w.get("undated"):
         return w["days"]
-    if posts is not None and any(not p.get("date") and not p.get("pinned") for p in posts
+    if posts is not None and any(not as_listed(p)[0] and not p.get("pinned") for p in posts
                                  if p.get("group") == g["group"]):
         return None
     try:
@@ -3008,7 +3124,7 @@ def build_report(out, name, since, note, prior, tz=None):
     with open(os.path.join(out, "posts.csv"), "w", newline="") as f:
         cols = ["platform", "group", "kind", "date", "date_approx", "posted_at", "views", "lift", "tier", "eng_lift",
                 "likes", "comments", "shares", "saves", "duration_s", "pinned", "caption", "url", "id",
-                "views_hidden", "slides", "recommends", "kind_checked"]
+                "views_hidden", "slides", "recommends", "kind_checked", "top_lookup", "listed_date"]
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for p in sorted(all_posts, key=lambda p: (p["platform"], p.get("date") or ""), reverse=True):
@@ -3109,6 +3225,12 @@ def build_report(out, name, since, note, prior, tz=None):
                 L.append(msg)
                 if note:
                     note("tiktok: " + msg)
+        tl = sum(1 for p in all_posts if p.get("group") == s["group"] and p.get("top_lookup"))
+        if tl:
+            L.append(f"{tl} top post{'' if tl == 1 else 's'} older than the newest --yt-enrich run "
+                     f"{'was' if tl == 1 else 'were'} looked up for {'its' if tl == 1 else 'their'} date and likes; "
+                     "everything sampled (dates above, cadence, rates, the format tables) counts "
+                     f"{'it' if tl == 1 else 'them'} as listed, so a top post can sit outside this range.")
         if s["pinned"]:
             L.append(f"{s['pinned']} pinned posts are listed for reference but sit outside the window: they stay out of "
                      "the dates, cadence, median and tier counts. Pinning keeps them in front of visitors, which explains part of their lift.")
@@ -3172,11 +3294,13 @@ def build_report(out, name, since, note, prior, tz=None):
           "lives on a few hits, not a repeatable format.",
           "- Median views leave out posts under 3 days old, unless a group has no older posts with views (the group "
           "says so). Like rate (n) shows how many posts had like counts.",
-          "- YouTube dates from flat listings are approximate unless enriched (date_approx in posts.csv and "
-          "summary.json, approx in the tables): YouTube only says \"3 months ago\", so the real upload can be months "
-          "earlier. Per week and the gap check use exact dates only. Shorts without enrichment have no date. The "
-          f"top {TOP_LOOKUPS} of each kind by views are looked up too, for their dates and likes; cadence, rates and "
-          "--since still read them as listed.",
+          *(["- YouTube dates from flat listings are approximate unless enriched (date_approx in posts.csv and "
+             "summary.json, approx in the tables): YouTube only says \"3 months ago\", so the real upload can be "
+             "months earlier. Per week and the gap check use exact dates only. Shorts without enrichment have no date."
+             + (f" The top {TOP_LOOKUPS} of each kind by views were looked up too, for their dates and likes "
+                "(top_lookup in posts.csv); cadence, rates, --since and the format tables still read them as listed."
+                if any(p.get("top_lookup") for p in all_posts) else "")]
+            if any(p["platform"] == "youtube" for p in all_posts) else []),
           "- Posts under 3 days old are still climbing. Don't compare them with older posts.",
           *(["- TikTok photo carousels get their own group (tiktok photos): their listed length is the song's, and "
              "they have no spoken hook. Reports before 1.2.0 counted them in the tiktok row."]
@@ -3718,7 +3842,7 @@ def main():
                    help="also read comments on the top TikTok posts, through TikTok's unofficial web comment list "
                         "(logged out, unsigned; it can stop answering at any time)")
     s.add_argument("--tz", type=tz_arg, help="time zone for the weekday and posting-time tables: a name like "
-                   "America/New_York (Python 3.9+), UTC, or an offset like -05:00 (default: this computer's zone)")
+                   "America/New_York (Python 3.9+), UTC, or an offset like UTC-05:00 (default: this computer's zone)")
     s.add_argument("--prev", help="an earlier scan folder of this account to compare with (default: the newest "
                    "earlier dated folder beside --out)")
     s.add_argument("--no-prev", action="store_true", help="leave out the Since last scan section")
@@ -3770,8 +3894,8 @@ def main():
     r.add_argument("--out", required=True)
     r.add_argument("--name")
     r.add_argument("--since")
-    r.add_argument("--tz", type=tz_arg, help="time zone for the weekday and posting-time tables (default: this "
-                   "computer's zone)")
+    r.add_argument("--tz", type=tz_arg, help="time zone for the weekday and posting-time tables: a name like "
+                   "America/New_York (Python 3.9+), UTC, or an offset like UTC-05:00 (default: this computer's zone)")
     r.add_argument("--prev", help="an earlier scan folder to compare with (default: the newest earlier dated folder)")
     r.add_argument("--no-prev", action="store_true", help="leave out the Since last scan section")
 
@@ -3783,7 +3907,12 @@ def main():
     cp.add_argument("dirs", nargs="+", metavar="DIR")
     cp.add_argument("--out", dest="compare_out", help="also write the table to this file")
 
-    a = ap.parse_args()
+    argv = sys.argv[1:]
+    for i in range(len(argv) - 1):  # argparse reads "--tz -05:00" as two options before Python 3.14
+        if argv[i] == "--tz" and OFFSET.fullmatch(argv[i + 1]):
+            argv[i:i + 2] = ["--tz=" + argv[i + 1]]
+            break
+    a = ap.parse_args(argv)
     if a.cmd == "doctor":
         sys.exit(doctor(a.get_model))
     if a.cmd == "diff":
