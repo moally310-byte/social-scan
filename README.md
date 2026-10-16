@@ -23,6 +23,7 @@ Plus, for each platform, where its public data allows:
 - **Snapchat Spotlights.** Views, likes, shares and top comments for the newest Spotlights the profile lists, which ones are long enough to earn (30 s+), upload bursts, missing descriptions and hashtags, and Snap's own title, keywords and content tags for the most-liked ones.
 - **Podcast standing.** Where the show ranks on Apple's and Spotify's US charts for its own categories, its US Apple rating with Apple's own split of those ratings by stars, a sample of Apple reviews for comment mining, and how often and how long it publishes, read from its own RSS feed.
 - **The numbers people skip.** Posting cadence, top-3 share (does the account live on a few hits?), followers per 1K views (not for Snapchat, which lists too few Spotlights and hides some views), and a flag when a gap in the data means a median can't be trusted.
+- **Since last scan.** Scan the same account again a month later and the report adds what changed: followers, each group's median, cadence and 2x+ count, the posts published since, the posts still climbing, the ones that became outliers, and the podcast's chart moves. It's a table you can paste into a client check-in.
 - **A brief.** Claude reads the report and writes what worked, why it likely worked, and three content tests to run next.
 
 Everything lands in the `--out` folder you give it, one per account: `summary.md`, `summary.json`, `posts.csv`, `hooks.json`, `comments.json`, `podcast.json` and `reviews_apple.json` for a podcast, the hook frames and the raw scrape files.
@@ -113,10 +114,12 @@ Just ask Claude:
 Or run it yourself. One command collects the posts, pulls the hooks and comments, and writes the report:
 
 ```bash
-python3 "$SCAN" scan --out ./scans/duolingo --youtube @duolingo --tiktok duolingo --name "Duolingo"
+python3 "$SCAN" scan --out "./scans/duolingo/$(date +%F)" --youtube @duolingo --tiktok duolingo --name "Duolingo"
 ```
 
-- Use a new `--out` folder for each account: `scan` reports everything already in the folder, and its notes say when posts or follower counts came from an earlier run.
+- Use a new `--out` folder for each account and run, dated: `./scans/duolingo/2026-10-16`. `scan` reports everything already in the folder, and its notes say when posts or follower counts came from an earlier run.
+- **Since last scan:** when `--out` is a dated folder, `scan` compares it with the newest earlier dated folder beside it that holds a report, and adds a "Since last scan" section. `--prev DIR` picks another earlier scan, and `--no-prev` leaves the section out. `diff OLD NEW` prints the same section for any two scan folders. The "then" numbers are rebuilt from the earlier folder's own posts as of the day it was collected. The section flags a group whose date window is more than 1.5 times longer in one scan (the same `--limit` covers a different range at a different cadence), names any platform collected in only one of the two scans instead of counting its posts as gone, ranks gains on rounded counts by what they are at least and marks the rough ones with ~, and counts a post as a new outlier only when its own views crossed 2x the earlier median and it's 2x+ now.
+- **Snapchat history:** logged out, Snapchat lists only the newest Spotlights, so every Snapchat collect also merges what it saw into `posts_snapchat_history.json` (first and last seen, and the counts at each pull), carried forward from the newest earlier dated folder that has one. The report lists the most-viewed Spotlights that have scrolled off the profile.
 - `--snapchat handle` adds Snapchat Spotlights (free, logged out) from a Public Profile. Snapchat lists only the newest Spotlights logged out (3 to 26 on accounts tested), with no paging, and hides view counts on its weakest ones: the report ranks those below every visible count, and when half or more are hidden it gives the median as "under" the lowest visible count and ranks the tables by likes.
 - `--instagram username` adds Instagram once `APIFY_TOKEN` is set.
 - `--podcast "Show name"` adds a Podcast block, and works on its own too:
@@ -129,7 +132,7 @@ python3 "$SCAN" scan --out ./scans/duolingo --youtube @duolingo --tiktok duoling
 - TikTok photo carousels get their own group (`tiktok photos`, next to `tiktok videos`): their listed length is the song's, and their first slide is the visual hook.
 - A step whose tool is missing is skipped, the report still gets written, and the notes at the end say what was left out. The last line printed is the path to `summary.md`.
 
-The single steps are still there for re-running one part, or for loading Instagram data pulled through the Apify MCP: `collect`, `ingest-ig`, `meta`, `hooks`, `comments`, `report`. `python3 "$SCAN" <step> --help` shows each one's flags.
+The single steps are still there for re-running one part, or for loading Instagram data pulled through the Apify MCP: `collect`, `ingest-ig`, `meta`, `hooks`, `comments`, `report`, and `diff OLD NEW`. `python3 "$SCAN" <step> --help` shows each one's flags.
 
 ## Cost
 
@@ -153,6 +156,7 @@ For a podcast, a scan makes a dozen or so single requests: Apple's Search API (o
 - `doctor` and `scan` are tested on macOS (Python 3.8, 3.9 and 3.14; yt-dlp 2026.08.19, ffmpeg 8.1, whisper.cpp 1.9.1, deno 2.9.7): full runs, runs with ffmpeg, whisper-cli or yt-dlp taken off `PATH`, a mistyped handle, a reused `--out` folder, and `doctor --get-model` (a real download, plus simulated cut-off, bad-checksum, network and Ctrl-C failures).
 - The Linux install lines follow each project's own docs (yt-dlp's standalone build, Ubuntu 26.04's `whisper.cpp` package or whisper.cpp's CMake build, apt for ffmpeg) but haven't been run on a Linux machine yet. If one trips, open an issue.
 - Snapchat Spotlights, TikTok photo carousels and TikTok follower counts are live-tested on public accounts, logged out (1.2.0).
+- Since last scan, `diff` and the Snapchat history (1.4.0) are live-tested on a creator's Snapchat plus podcast and on Duolingo's YouTube and TikTok, each against an earlier scan folder, plus offline tests for finding the earlier folder, new versus older posts, different windows, older summary files and the history merge.
 - The Podcast block (1.3.0) is live-tested on four shows, from one with 7 ratings to Apple's #1, by name, Apple ID and pasted show link, on its own and alongside a Snapchat scan, plus a name with no match. Offline tests cover failed and malformed sources, the review fallback, shared, non-Latin and all-digit names, young and future-dated feeds, feeds with an inline DTD, and cut-off downloads.
 - YouTube, TikTok and Instagram (through the Apify MCP) are live-tested. The direct Instagram call (`--instagram`) is tested against a mocked Apify response; if your first live run trips on something, open an issue.
 

@@ -40,6 +40,10 @@ Sources: YouTube via yt-dlp, top-sorted, up to `--max` per post. Podcasts from A
 5. Turn it into actions: reply-video ideas, FAQ or content ideas, objection angles.
 6. State the sample (posts, comments, newest-only for IG, which source the podcast reviews came from) and confidence. One post's comments are not market sentiment.
 
+## Monthly check-ins (built into `scan`)
+
+Scan the account into a new dated folder (`<project>/social-scan/<account>/<YYYY-MM-DD>/`) with the same `--limit` and `--yt-enrich` as last time. The report's "Since last scan" section then lists follower change, each group's median, cadence, 2x+ count and top-3 share then and now, the posts published since (with lift), the posts still climbing, and the ones that became outliers. Lead the check-in with what moved and why it likely moved; a median change in a group flagged "Different windows" is partly the window, not the content, and a gain marked ~ is approximate, give or take one rounding step.
+
 ## Competitor teardown (method only; no `compare` command yet)
 
 1. Confirm each handle belongs to the right brand before pulling; a shared name is not a match.
