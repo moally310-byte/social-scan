@@ -31,14 +31,14 @@ For each top post and its bottom-post contrast, look at:
 
 ## Comment mining (`comments` command, then judgment)
 
-Sources: YouTube via yt-dlp, top-sorted, up to `--max` per post. Instagram from the reels scrape itself (`latestComments`, the newest ~15 per post, no extra cost). Snapchat from the profile page itself (the top ~25 per Spotlight, with likes and `by_creator`, no extra cost). TikTok returns 0 comments logged out (see Gaps). Handles are dropped on purpose; `by_creator` flags the account's own replies so they aren't read as audience.
+Sources: YouTube via yt-dlp, top-sorted, up to `--max` per post. Podcasts from Apple's US review feed (`reviews_apple.json`: newest first, 50 a page and up to 10 pages; Apple serves some pages empty, and the report names any it skipped; when page 1, the newest 50, is empty, the reviews on the US show page are added), or the handful Apple shows on the US show page when no page answers, with rating, title, text and date. Instagram from the reels scrape itself (`latestComments`, the newest ~15 per post, no extra cost). Snapchat from the profile page itself (the top ~25 per Spotlight, with likes and `by_creator`, no extra cost). TikTok returns 0 comments logged out (see Gaps). Handles are dropped on purpose; `by_creator` flags the account's own replies so they aren't read as audience.
 
 1. Drop spam, bots, emoji-only replies and creator replies.
 2. Tag each useful comment: questions, objections, complaints or pain points, praise, confusion, requests or ideas, buying intent, controversy or debate, jokes or culture signals.
 3. Cluster into themes. Score each by frequency (how many) and intensity (strength of wording, likes). One loud comment is not a pattern.
 4. Keep exact wording for anything reusable. Slang and misspellings are the point.
 5. Turn it into actions: reply-video ideas, FAQ or content ideas, objection angles.
-6. State the sample (posts, comments, newest-only for IG) and confidence. One post's comments are not market sentiment.
+6. State the sample (posts, comments, newest-only for IG, which source the podcast reviews came from) and confidence. One post's comments are not market sentiment.
 
 ## Competitor teardown (method only; no `compare` command yet)
 
