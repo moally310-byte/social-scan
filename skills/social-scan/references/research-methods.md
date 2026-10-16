@@ -6,9 +6,9 @@ Read this after `report` when writing the brief, and before comparing accounts.
 
 ## Outlier scoring (built into `report`)
 
-- Baseline = the **median** views of the group (platform x format: reels, photos/carousels, TikTok, Shorts, long-form), never the mean, so one hit can't move it. Posts under 3 days old stay out of the baseline.
+- Baseline = the **median** views of the group (platform x format: Instagram reels, Instagram photos/carousels, TikTok videos, TikTok photos, YouTube Shorts, YouTube long-form, Snapchat Spotlight), never the mean, so one hit can't move it. Posts under 3 days old stay out of the baseline.
 - `lift = views / group median`. Tiers: **huge 5x+, strong 2-5x, mild 1.5-2x** (source). Under 0.2x is a dud (ours).
-- `Eng. lift = (likes + comments) / group median of the same`. Shares and saves only exist on TikTok logged out, so they stay out (ours). Shown only when 10+ posts in the group have like counts.
+- `Eng. lift = (likes + comments) / group median of the same`. Shares only exist logged out on TikTok and Snapchat, and saves only on TikTok, so both stay out to keep the number comparable across platforms (ours). Shown only when 10+ posts in the group have like counts.
 - Confidence: low under 10 baseline posts (source: "do not overstate confidence from fewer than 10 posts"). Medium 10-19, high 20+ (ours: the source only says "pull at least 20").
 - Lift is within one account's group. Never rank raw views across accounts of different sizes, and never pool platforms into one baseline.
 - Pinned posts get a lift boost from placement; fresh posts are still climbing. Both are marked in the table.
@@ -17,21 +17,21 @@ Read this after `report` when writing the brief, and before comparing accounts.
 ## Why it worked (the brief, written by Claude)
 
 For each top post and its bottom-post contrast, look at:
-- **The three hook channels:** text hook (caption opening), spoken hook (first 10 s), visual hook (`hooks/*.jpg`, often carries on-screen text). Strong posts usually stack two.
+- **The three hook channels:** text hook (caption opening), spoken hook (first 10 s; Snap's own transcript for Snapchat Spotlights, whisper-cli for the rest), visual hook (`hooks/*.jpg`: the frame at 0.5 s, or a photo post's image; often carries on-screen text). Strong posts usually stack two.
 - **Hook category** (ours): curiosity, contrarian, problem-aware, outcome, story, authority, comparison, mistake, demonstration, before/after, timely, identity, objection-handling. Tag top and bottom hooks; a category that repeats only in the top rows is a finding.
 - Topic, format, guest or creator authority, novelty or timeliness (a release, a season), emotional trigger, controversy, and what the comments show (confusion, desire, debate).
 - Say "appears to" or "suggests". Performance shows correlation; the account's own analytics would show cause.
 
 ## Hooks (`hooks` command)
 
-- Text hook = the caption's opening sentence (verbatim). Spoken hook = whisper-cli base.en on the first 20 s, keeping confident segments that start in the first 10 s. Visual hook = the frame at 0.5 s.
+- Text hook = the caption's opening sentence (verbatim). Spoken hook = Snap's own transcript for Snapchat Spotlights, else whisper-cli base.en on the first 20 s, keeping confident segments that start in the first 10 s. Visual hook = the frame at 0.5 s, or a photo post's image (a TikTok carousel's first slide, an image Spotlight).
 - Machine transcripts get names and small words wrong ("I don't have" for "they don't have" in testing). Quote a spoken hook in client copy only after checking it against the video or the frame's burned-in captions.
 - "No speech found" means music, animal sound, or a text-only open. The frame shows which. Whisper's default no-speech cut turned bird calls into "I'm not sure."; the script runs `-nth 0.3`.
 - For a full transcript of a specific post (segment it into hook, setup, claim, evidence, payoff, CTA; pull claims, stories, frameworks, quotable lines), use a transcript tool on that post. Keep every quote tied to its URL.
 
 ## Comment mining (`comments` command, then judgment)
 
-Sources: YouTube via yt-dlp, top-sorted, up to `--max` per post. Instagram from the reels scrape itself (`latestComments`, the newest ~15 per post, no extra cost). TikTok returns 0 comments logged out (see Gaps). Handles are dropped on purpose; `by_creator` flags the account's own replies so they aren't read as audience.
+Sources: YouTube via yt-dlp, top-sorted, up to `--max` per post. Instagram from the reels scrape itself (`latestComments`, the newest ~15 per post, no extra cost). Snapchat from the profile page itself (the top ~25 per Spotlight, with likes and `by_creator`, no extra cost). TikTok returns 0 comments logged out (see Gaps). Handles are dropped on purpose; `by_creator` flags the account's own replies so they aren't read as audience.
 
 1. Drop spam, bots, emoji-only replies and creator replies.
 2. Tag each useful comment: questions, objections, complaints or pain points, praise, confusion, requests or ideas, buying intent, controversy or debate, jokes or culture signals.
