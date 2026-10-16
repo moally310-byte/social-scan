@@ -3,7 +3,9 @@
 
 Backends
   YouTube, TikTok  -> yt-dlp, run here (logged out, no cookies); TikTok
-                      followers and photo carousels from the public pages
+                      followers and photo carousels from the public pages,
+                      and comments (opt-in, --tiktok-comments) from TikTok's
+                      unofficial web comment list, logged out and unsigned
   Snapchat         -> the public profile page (logged out, no cookies): the
                       newest Spotlights it lists, with no logged-out paging
   Podcast          -> Apple's Search API, chart and review feeds, Spotify's
@@ -16,7 +18,8 @@ Start here
   doctor     [--get-model]   what's installed, what each missing piece turns off,
                              and the install line for macOS and Linux
   scan       --out DIR [--youtube H] [--tiktok H] [--instagram H] [--snapchat H] [--podcast SHOW] [--name N] [--prev DIR]
-             [--tiktok-followers N] [--limit N | --days N] [--yt-enrich N] [--no-hooks] [--no-comments] [--no-prev]
+             [--tiktok-followers N] [--limit N | --days N] [--yt-enrich N] [--no-hooks] [--no-comments]
+             [--tiktok-comments] [--no-prev]
                              collect, hooks, comments and report in one go;
                              a step whose tool is missing is skipped with a note.
                              Use one dated --out folder per account and run
@@ -29,7 +32,7 @@ Single steps
   ingest-ig  --out DIR (--reels reels.json | --posts posts.json) [--profile profile.json]
   meta       --out DIR --platform P --followers N [--following N] [--source TEXT]
   hooks      --out DIR [--top N] [--bottom N] [--seconds S]
-  comments   --out DIR [--top N] [--max N]
+  comments   --out DIR [--top N] [--max N] [--tiktok-comments]
   report     --out DIR [--name NAME] [--since YYYY-MM-DD] [--prev DIR | --no-prev]
   diff       OLD NEW         what changed between two scan folders of one account
   compare    DIR DIR ... [--out FILE]   one table across accounts, one scan folder each
@@ -1706,10 +1709,115 @@ def hooks_section(out, all_posts):
     return L
 
 
-def comments(out, top, max_comments):
-    """Comment text for the top posts: YouTube via yt-dlp, Instagram from the posts scrape."""
+def mask_mentions(text, extra=None):
+    """Comment text with mentions masked. TikTok's own mention spans (the
+    text_extra entries that name a user) go first, each read both as
+    characters and as UTF-16 units so either reading is covered; then any
+    typed @name and any email address."""
+    t = str(text or "")
+    drop = [False] * len(t)
+    unit = []  # the character each UTF-16 unit belongs to
+    for i, ch in enumerate(t):
+        unit += [i] * (2 if ord(ch) > 0xFFFF else 1)
+    for x in extra or []:
+        if not isinstance(x, dict) or not (x.get("user_id") or x.get("sec_uid")):
+            continue
+        st, en = x.get("start"), x.get("end")
+        if not isinstance(st, int) or not isinstance(en, int) or not 0 <= st < en:
+            continue
+        spans = []
+        if st < len(t):
+            spans.append((st, min(en, len(t))))
+        if st < len(unit):
+            spans.append((unit[st], unit[min(en, len(unit)) - 1] + 1))
+        at = [sp for sp in spans if t[sp[0]] in "@＠"]
+        for a, b in (at[:1] if len(at) == 1 else spans):  # the reading that lands on the "@", else both to be safe
+            for i in range(a, b):
+                drop[i] = True
+    out, i = [], 0
+    while i < len(t):
+        if drop[i]:
+            while i < len(t) and drop[i]:
+                i += 1
+            out.append("@…")
+        else:
+            out.append(t[i])
+            i += 1
+    t = re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", "…@…", "".join(out))
+    return re.sub(r"[@＠]\s?(?!…)[^\s@＠]+", "@…", t)
+
+
+def tiktok_comments(post, max_n=100):
+    """Comments on one TikTok post from TikTok's web comment list, logged out
+    and unsigned. The endpoint is unofficial, so it can stop answering at any
+    time. Top-level comments only (reply threads aren't read; `replies` is
+    their count). Keeps text, likes, replies, creator-liked, language and
+    date; the commenter's handle is compared with the creator's and never
+    saved. Returns (comments, total, why the read stopped early or None)."""
+    import urllib.parse
+    m = re.search(r"tiktok\.com/@([^/?#]+)/", post.get("url") or "")
+    creator = (m.group(1) if m else "").casefold()
+    out, seen, cursor, total, stopped = [], set(), 0, None, None
+    for page in range(10):  # 20 a page asked, about 13-14 come back
+        time.sleep(0.5)  # a polite gap before every request, the first of each post included
+        u = "https://www.tiktok.com/api/comment/list/?" + urllib.parse.urlencode(
+            {"aid": 1988, "aweme_id": post["id"], "count": 20, "cursor": cursor})
+        try:
+            try:
+                d = fetch_json(u)
+            except RuntimeError as e:
+                if "unreadable JSON" in str(e):  # an empty or HTML answer: the usual sign of a blocked request
+                    raise RuntimeError("TikTok's comment list sent nothing usable (it may want signed requests now)")
+                raise RuntimeError(str(e).replace(u, "TikTok's comment list"))
+            if not isinstance(d, dict):
+                raise RuntimeError("TikTok's comment list sent an unexpected answer")
+            code = d.get("status_code")
+            if code not in (None, 0, "0"):
+                raise RuntimeError(f"TikTok's comment list refused the request (status {code}"
+                                   + (f": {str(d.get('status_msg'))[:80]}" if d.get("status_msg") else "") + ")")
+            listed = num(post.get("comments")) or 0
+            if page == 0 and not d.get("comments") and listed > 2:  # a soft block: an empty answer for a post with comments
+                raise RuntimeError(f"TikTok's comment list sent no comments for a post that lists {listed:,} "
+                                   "(it may want signed requests now)")
+        except RuntimeError as e:
+            if not out:
+                raise
+            stopped = f"stopped after {len(out)}: {e}"  # keep what was read
+            break
+        total = num(d.get("total")) if total is None else total
+        for c in d.get("comments") or []:
+            if len(out) >= max_n:
+                break
+            if not isinstance(c, dict) or not c.get("text") or c.get("cid") in seen:
+                continue
+            seen.add(c.get("cid"))
+            user = c.get("user") if isinstance(c.get("user"), dict) else {}
+            ts = num(c.get("create_time"))
+            out.append({"text": mask_mentions(c["text"], c.get("text_extra")), "likes": num(c.get("digg_count")),
+                        "replies": num(c.get("reply_comment_total")), "creator_liked": bool(c.get("is_author_digged")),
+                        "lang": c.get("comment_language") or None,
+                        "date": dt.datetime.fromtimestamp(ts, dt.timezone.utc).date().isoformat() if ts else None,
+                        "by_creator": bool(creator) and str(user.get("unique_id") or "").casefold() == creator})
+        if len(out) >= max_n or not d.get("has_more") or not d.get("comments"):
+            break
+        cursor = num(d.get("cursor")) or cursor + 20
+    return out, total, stopped
+
+
+def comments(out, top, max_comments, tiktok=False):
+    """Comment text for the top posts: YouTube via yt-dlp, Instagram from the posts
+    scrape, Snapchat from the profile page, and TikTok (with tiktok=True) from
+    TikTok's unofficial web comment list."""
     all_posts, metas, _ = load_posts(out)
-    targets = [t for t in pick_targets(build_groups(all_posts, metas), top, 0) if t[0] != "tiktok"]
+    every = pick_targets(build_groups(all_posts, metas), top, 0)
+    targets = [t for t in every if tiktok or t[0] != "tiktok"]
+    earlier = load(os.path.join(out, "comments.json"), []) or []
+    tk_now = {t[3]["id"]: t for t in every if t[0] == "tiktok"}
+    kept_tk = [] if tiktok else [dict(e, group=tk_now[e["id"]][1], lift=tk_now[e["id"]][3].get("lift"),
+                                      tier=tk_now[e["id"]][3].get("tier"))
+                                 for e in earlier if e.get("platform") == "tiktok" and e.get("comments")
+                                 and e.get("id") in tk_now]
+    slow = None  # set once TikTok answers 429: no more TikTok requests this run
     prev = {e["id"]: e for e in load(os.path.join(out, "comments.json"), []) or []
             if e.get("platform") == "youtube" and not (e.get("source") or "").startswith("yt-dlp failed")}
     no_ytdlp = not shutil.which(YTDLP)
@@ -1735,21 +1843,46 @@ def comments(out, top, max_comments):
             else:
                 e["source"] = "yt-dlp, top-sorted"
                 # handles dropped on purpose; uploader replies flagged so they aren't read as audience
-                e["comments"] = [{"text": c.get("text"), "likes": num(c.get("like_count")),
+                e["comments"] = [{"text": mask_mentions(c.get("text")), "likes": num(c.get("like_count")),
                                   "date": to_date(c), "reply": c.get("parent") != "root",
                                   "by_creator": bool(c.get("author_is_uploader"))}
                                  for c in d.get("comments") or [] if c.get("text")]
         elif plat == "snapchat":
             e["source"] = "snapchat profile page (top comments only, about 25 per Spotlight)"
             e["comments"] = snap_inline.get(p["id"], [])
+        elif plat == "tiktok" and slow:
+            e["source"] = f"tiktok comments didn't load: skipped, TikTok asked to slow down on an earlier post ({slow})"
+        elif plat == "tiktok":
+            try:
+                e["comments"], total, stopped = tiktok_comments(p, max_comments)
+            except Exception as err:
+                e["source"] = f"tiktok comments didn't load: {err}"
+                if "HTTP 429" in str(err):
+                    slow = "HTTP 429"
+            else:
+                e["source"] = ("tiktok web comment list (unofficial, logged out; top-level comments in TikTok's own order"
+                               + (f", {len(e['comments'])} of {total:,} counting replies" if total else "")
+                               + (f"; {stopped}" if stopped else "") + ")")
+                if stopped and "HTTP 429" in stopped:
+                    slow = "HTTP 429"
         else:
             e["source"] = "instagram posts scrape (newest comments only)"
-            e["comments"] = inline.get(p["id"], [])
+            e["comments"] = [dict(c, text=mask_mentions(c.get("text"))) if isinstance(c, dict) else c
+                             for c in inline.get(p["id"], [])]
         result.append(e)
+    result += kept_tk  # an earlier --tiktok-comments read, kept when this run leaves TikTok out
     save(os.path.join(out, "comments.json"), result)
     n = sum(len(e["comments"]) for e in result)
-    print(f"  comments: {n} comments across {len(result)} posts -> comments.json "
-          "(TikTok comments don't load logged out; see references/research-methods.md)", file=sys.stderr)
+    tk = [e for e in result if e["platform"] == "tiktok" and e not in kept_tk]
+    tk_bad = [e for e in tk if (e.get("source") or "").startswith("tiktok comments didn't load")]
+    tk_cut = [e for e in tk if "; stopped after " in (e.get("source") or "")]
+    skipped = not tiktok and any(t[0] == "tiktok" for t in every)
+    print(f"  comments: {n} comments across {len(result)} posts -> comments.json"
+          + (f" (TikTok comments are off: scan --tiktok-comments or comments --tiktok turns them on, through an "
+             "unofficial endpoint; see references/research-methods.md"
+             + (f"; the {len(kept_tk)} TikTok posts read earlier are kept" if kept_tk else "") + ")" if skipped else "")
+          + (f"; TikTok: {len(tk) - len(tk_bad)} of {len(tk)} posts loaded" if tk else "")
+          + (f", {len(tk_cut)} cut short" if tk_cut else ""), file=sys.stderr)
 
 
 def load_posts(out, since=None):
@@ -3197,15 +3330,26 @@ def scan(a):
                          + (f"; {len(failed)} clip{'' if len(failed) == 1 else 's'} failed (first: {failed[0]['spoken_status'][:100]})"
                             if failed else "") + " (`doctor` has the fixes)")
     if not a.no_comments:
-        if not shutil.which(YTDLP) and not any(p["platform"] in ("instagram", "snapchat") for p in posts):
+        if not shutil.which(YTDLP) and not any(p["platform"] in ("instagram", "snapchat") for p in posts) \
+                and not (a.tiktok_comments and any(p["platform"] == "tiktok" for p in posts)):
             note("comments skipped: yt-dlp isn't installed")
         else:
             try:
-                comments(a.out, 3, 100)
+                comments(a.out, 3, 100, tiktok=a.tiktok_comments)
             except Exception as e:
                 note(f"comments failed: {e}")
             else:
                 cs = load(os.path.join(a.out, "comments.json"), []) or []
+                tk_bad = [c for c in cs if (c.get("source") or "").startswith("tiktok comments didn't load")]
+                tk_cut = [c for c in cs if "; stopped after " in (c.get("source") or "")]
+                if tk_cut:
+                    note(f"comments: TikTok's comment list stopped partway on {len(tk_cut)} post"
+                         f"{'' if len(tk_cut) == 1 else 's'} (first: {tk_cut[0]['source'].split('; stopped after ', 1)[1][:100]}); "
+                         "what was read is kept")
+                if tk_bad:
+                    note(f"comments: TikTok's comment list didn't answer for {len(tk_bad)} of "
+                         f"{sum(1 for c in cs if c.get('platform') == 'tiktok')} posts ({tk_bad[0]['source'].split(': ', 1)[-1][:100]}); "
+                         "the endpoint is unofficial, so this can happen at any time")
                 bad = [c for c in cs if (c.get("source") or "").startswith("yt-dlp failed")]
                 if bad:
                     note(f"comments: {len(bad)} of {len(cs)} posts didn't load (first: {bad[0]['source'][:120]})")
@@ -3243,6 +3387,13 @@ def scan(a):
 
 # ---------- cli ----------
 
+def positive_int(v):
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("needs a number, 1 or more")
+    return n
+
+
 def main():
     # before argparse: on Python 3.6 add_subparsers(required=...) itself fails
     if sys.version_info < MIN_PY:
@@ -3274,6 +3425,9 @@ def main():
                    help="fetch likes/comments/exact dates for the newest N YouTube uploads (default 45, 0 = off)")
     s.add_argument("--no-hooks", action="store_true", help="skip the hooks step")
     s.add_argument("--no-comments", action="store_true", help="skip the comments step")
+    s.add_argument("--tiktok-comments", action="store_true",
+                   help="also read comments on the top TikTok posts, through TikTok's unofficial web comment list "
+                        "(logged out, unsigned; it can stop answering at any time)")
     s.add_argument("--prev", help="an earlier scan folder of this account to compare with (default: the newest "
                    "earlier dated folder beside --out)")
     s.add_argument("--no-prev", action="store_true", help="leave out the Since last scan section")
@@ -3312,10 +3466,13 @@ def main():
     h.add_argument("--bottom", type=int, default=2, help="bottom posts per group, for contrast (default 2)")
     h.add_argument("--seconds", type=int, default=20, help="seconds of video to fetch per post (default 20)")
 
-    k = sub.add_parser("comments", help="comment text for the top posts (YouTube, Instagram, Snapchat)")
+    k = sub.add_parser("comments", help="comment text for the top posts (YouTube, Instagram, Snapchat; TikTok with --tiktok)")
     k.add_argument("--out", required=True)
     k.add_argument("--top", type=int, default=3, help="top posts per group (default 3)")
-    k.add_argument("--max", type=int, default=100, help="YouTube comments per post (default 100)")
+    k.add_argument("--max", type=positive_int, default=100,
+                   help="comments per post (default 100); TikTok also stops at 10 pages, about 130-170")
+    k.add_argument("--tiktok-comments", "--tiktok", dest="tiktok", action="store_true",
+                   help="also TikTok, through its unofficial web comment list")
 
     r = sub.add_parser("report", help="write summary.md, summary.json and posts.csv")
     r.add_argument("--out", required=True)
@@ -3392,7 +3549,7 @@ def main():
         hooks(a.out, a.top, a.bottom, a.seconds)
         print("  run `report` to add the Hooks section to summary.md", file=sys.stderr)
     elif a.cmd == "comments":
-        comments(a.out, a.top, a.max)
+        comments(a.out, a.top, a.max, tiktok=a.tiktok)
     elif a.cmd == "report":
         print(report(a.out, a.name, a.since, prior=None if a.no_prev else (a.prev or "auto")))
 
